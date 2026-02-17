@@ -1,10 +1,15 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
+import { createClient } from '@/lib/supabase/client'
 import { ChatSidebar } from '@/components/chat/chat-sidebar'
 import { ChatArea } from '@/components/chat/chat-area'
 import { ProfilePanel } from '@/components/chat/profile-panel'
 import { SearchUsersPanel } from '@/components/chat/search-users-panel'
+import { IncomingCallOverlay } from '@/components/chat/incoming-call-overlay'
+import { ActiveCallScreen } from '@/components/chat/active-call-screen'
+import { useWebRTC } from '@/hooks/use-webrtc'
+import type { Profile } from '@/lib/types'
 
 export default function ChatPage() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
@@ -12,6 +17,40 @@ export default function ChatPage() {
   const [showProfile, setShowProfile] = useState(false)
   const [showSearch, setShowSearch] = useState(false)
   const [sidebarKey, setSidebarKey] = useState(0)
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null)
+  const [remoteUserProfile, setRemoteUserProfile] = useState<Profile | null>(null)
+
+  const supabase = createClient()
+
+  const webrtc = useWebRTC({
+    currentUserId,
+    conversationId: activeConversationId,
+  })
+
+  // Get current user ID
+  useEffect(() => {
+    const getUser = async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (user) setCurrentUserId(user.id)
+    }
+    getUser()
+  }, [supabase])
+
+  // Load remote user profile when call comes in
+  const loadRemoteProfile = useCallback(async (userId: string) => {
+    const { data } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single()
+    if (data) setRemoteUserProfile(data)
+  }, [supabase])
+
+  useEffect(() => {
+    if (webrtc.remoteUserId) {
+      loadRemoteProfile(webrtc.remoteUserId)
+    }
+  }, [webrtc.remoteUserId, loadRemoteProfile])
 
   const handleSelectConversation = (conversationId: string, userId: string) => {
     setActiveConversationId(conversationId)
@@ -25,6 +64,12 @@ export default function ChatPage() {
     setOtherUserId(userId)
     setShowSearch(false)
     setSidebarKey((prev) => prev + 1)
+  }
+
+  const handleStartCall = (type: 'audio' | 'video') => {
+    if (otherUserId) {
+      webrtc.startCall(otherUserId, type)
+    }
   }
 
   // Update document title with unread indicator
@@ -60,6 +105,8 @@ export default function ChatPage() {
           key={activeConversationId}
           conversationId={activeConversationId}
           otherUserId={otherUserId}
+          onStartCall={handleStartCall}
+          isInCall={webrtc.callState !== 'idle'}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center bg-background">
@@ -70,6 +117,33 @@ export default function ChatPage() {
             </p>
           </div>
         </div>
+      )}
+
+      {/* Incoming call overlay */}
+      {webrtc.callState === 'ringing' && (
+        <IncomingCallOverlay
+          caller={remoteUserProfile}
+          callType={webrtc.callType}
+          onAnswer={webrtc.answerCall}
+          onDecline={webrtc.declineCall}
+        />
+      )}
+
+      {/* Active call / Calling screen */}
+      {(webrtc.callState === 'calling' || webrtc.callState === 'active' || webrtc.callState === 'ended') && (
+        <ActiveCallScreen
+          callState={webrtc.callState}
+          callType={webrtc.callType}
+          remoteUser={remoteUserProfile}
+          isMuted={webrtc.isMuted}
+          isCameraOff={webrtc.isCameraOff}
+          callDuration={webrtc.callDuration}
+          localVideoRef={webrtc.localVideoRef}
+          remoteVideoRef={webrtc.remoteVideoRef}
+          onToggleMute={webrtc.toggleMute}
+          onToggleCamera={webrtc.toggleCamera}
+          onEndCall={webrtc.endCall}
+        />
       )}
     </div>
   )

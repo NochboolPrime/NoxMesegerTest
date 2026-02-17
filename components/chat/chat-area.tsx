@@ -6,15 +6,17 @@ import type { Message, Profile } from '@/lib/types'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { MessageInput } from '@/components/chat/message-input'
 import { MessageBubble } from '@/components/chat/message-bubble'
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, Phone, Video } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 interface ChatAreaProps {
   conversationId: string
   otherUserId: string
+  onStartCall?: (type: 'audio' | 'video') => void
+  isInCall?: boolean
 }
 
-export function ChatArea({ conversationId, otherUserId }: ChatAreaProps) {
+export function ChatArea({ conversationId, otherUserId, onStartCall, isInCall }: ChatAreaProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [otherUser, setOtherUser] = useState<Profile | null>(null)
   const [currentUserId, setCurrentUserId] = useState<string | null>(null)
@@ -226,7 +228,7 @@ export function ChatArea({ conversationId, otherUserId }: ChatAreaProps) {
             <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full bg-green-500 ring-2 ring-background" />
           )}
         </div>
-        <div>
+        <div className="flex-1">
           <h2 className="font-semibold text-foreground text-sm">
             {otherUser?.display_name || 'User'}
           </h2>
@@ -238,6 +240,30 @@ export function ChatArea({ conversationId, otherUserId }: ChatAreaProps) {
             )}
           </p>
         </div>
+        {onStartCall && (
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9 text-muted-foreground hover:text-foreground"
+              onClick={() => onStartCall('audio')}
+              disabled={isInCall}
+            >
+              <Phone className="h-4 w-4" />
+              <span className="sr-only">Audio call</span>
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9 text-muted-foreground hover:text-foreground"
+              onClick={() => onStartCall('video')}
+              disabled={isInCall}
+            >
+              <Video className="h-4 w-4" />
+              <span className="sr-only">Video call</span>
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Messages */}
