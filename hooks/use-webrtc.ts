@@ -38,6 +38,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
   const remoteStreamRef = useRef<MediaStream | null>(null)
   const localVideoRef = useRef<HTMLVideoElement | null>(null)
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([])
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -150,11 +151,26 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       remoteStreamRef.current = remoteStream
 
       pc.ontrack = (event) => {
-        event.streams[0].getTracks().forEach((track) => {
-          remoteStream.addTrack(track)
-        })
+        // Add tracks from the event — handle both stream-based and individual tracks
+        if (event.streams && event.streams[0]) {
+          event.streams[0].getTracks().forEach((track) => {
+            if (!remoteStream.getTrackById(track.id)) {
+              remoteStream.addTrack(track)
+            }
+          })
+        } else {
+          // Some browsers deliver tracks without a stream
+          if (!remoteStream.getTrackById(event.track.id)) {
+            remoteStream.addTrack(event.track)
+          }
+        }
+        // Attach to the media element if available
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream
+        }
+        // Also try the audio ref
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = remoteStream
         }
       }
 
@@ -459,6 +475,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     callDuration,
     localVideoRef,
     remoteVideoRef,
+    remoteAudioRef,
+    remoteStream: remoteStreamRef,
     startCall,
     answerCall,
     declineCall,

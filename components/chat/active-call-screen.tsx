@@ -1,11 +1,12 @@
 'use client'
 
+import { useEffect } from 'react'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Mic, MicOff, VideoIcon, VideoOff, PhoneOff } from 'lucide-react'
 import type { Profile } from '@/lib/types'
 import type { CallState } from '@/hooks/use-webrtc'
-import type { RefObject } from 'react'
+import type { RefObject, MutableRefObject } from 'react'
 
 interface ActiveCallScreenProps {
   callState: CallState
@@ -16,6 +17,8 @@ interface ActiveCallScreenProps {
   callDuration: number
   localVideoRef: RefObject<HTMLVideoElement | null>
   remoteVideoRef: RefObject<HTMLVideoElement | null>
+  remoteAudioRef: RefObject<HTMLAudioElement | null>
+  remoteStream: MutableRefObject<MediaStream | null>
   onToggleMute: () => void
   onToggleCamera: () => void
   onEndCall: () => void
@@ -30,10 +33,25 @@ export function ActiveCallScreen({
   callDuration,
   localVideoRef,
   remoteVideoRef,
+  remoteAudioRef,
+  remoteStream,
   onToggleMute,
   onToggleCamera,
   onEndCall,
 }: ActiveCallScreenProps) {
+  // Re-attach remote stream to media elements when the component mounts or call becomes active.
+  // This fixes the issue where ontrack fires before the DOM elements exist.
+  useEffect(() => {
+    const stream = remoteStream.current
+    if (!stream) return
+
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = stream
+    }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = stream
+    }
+  }, [callState, remoteStream, remoteVideoRef, remoteAudioRef])
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)
     const s = seconds % 60
@@ -76,6 +94,8 @@ export function ActiveCallScreen({
               playsInline
               className="h-full w-full object-cover"
             />
+            {/* Hidden audio element to ensure remote audio always plays */}
+            <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
             {/* Local video (small picture-in-picture) */}
             <div className="absolute right-4 top-4 overflow-hidden rounded-xl border-2 border-border shadow-lg">
@@ -129,8 +149,8 @@ export function ActiveCallScreen({
               <p className="mt-2 text-base text-muted-foreground">{statusText()}</p>
             </div>
 
-            {/* Hidden audio elements */}
-            <audio ref={remoteVideoRef as React.RefObject<HTMLAudioElement>} autoPlay className="hidden" />
+            {/* Hidden audio element for remote audio playback */}
+            <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
           </div>
         )}
       </div>
