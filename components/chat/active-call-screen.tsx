@@ -21,6 +21,7 @@ interface ActiveCallScreenProps {
   remoteVideoRef: RefObject<HTMLVideoElement | null>
   remoteAudioRef: RefObject<HTMLAudioElement | null>
   remoteStream: MutableRefObject<MediaStream | null>
+  localStream: MutableRefObject<MediaStream | null>
   onToggleMute: () => void
   onToggleCamera: () => void
   onEnableCamera: () => void
@@ -42,6 +43,7 @@ export function ActiveCallScreen({
   remoteVideoRef,
   remoteAudioRef,
   remoteStream,
+  localStream,
   onToggleMute,
   onToggleCamera,
   onEnableCamera,
@@ -49,18 +51,23 @@ export function ActiveCallScreen({
   onToggleScreenShare,
   onEndCall,
 }: ActiveCallScreenProps) {
-  // Re-attach remote stream to media elements when the component mounts or call becomes active.
+  // Re-attach streams to media elements when the component mounts or call becomes active.
   useEffect(() => {
-    const stream = remoteStream.current
-    if (!stream) return
-
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.srcObject = stream
+    const remote = remoteStream.current
+    if (remote) {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = remote
+      }
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = remote
+      }
     }
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.srcObject = stream
+    // Re-attach local stream for video preview
+    const local = localStream.current
+    if (local && localVideoRef.current) {
+      localVideoRef.current.srcObject = local
     }
-  }, [callState, remoteStream, remoteVideoRef, remoteAudioRef])
+  }, [callState, hasVideo, isScreenSharing, remoteStream, remoteVideoRef, remoteAudioRef, localStream, localVideoRef])
 
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)

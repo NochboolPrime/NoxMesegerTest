@@ -34,11 +34,17 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
   // Refs for mutable state to avoid stale closures in the signal handler
   const callStateRef = useRef<CallState>('idle')
   const callIdRef = useRef<string | null>(null)
+  const isScreenSharingRef = useRef(false)
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   const remoteStreamRef = useRef<MediaStream | null>(null)
+  // Store the sender for the video slot so we can replaceTrack reliably
+  const videoSenderRef = useRef<RTCRtpSender | null>(null)
+  // Store the sender for the screen audio so we can remove it cleanly
+  const screenAudioSenderRef = useRef<RTCRtpSender | null>(null)
+
   const localVideoRef = useRef<HTMLVideoElement | null>(null)
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null)
@@ -53,6 +59,14 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
   // Keep refs in sync with state
   useEffect(() => { callStateRef.current = callState }, [callState])
   useEffect(() => { callIdRef.current = callId }, [callId])
+  useEffect(() => { isScreenSharingRef.current = isScreenSharing }, [isScreenSharing])
+
+  // Helper: attach stream to a media element
+  const attachStream = useCallback((el: HTMLVideoElement | HTMLAudioElement | null, stream: MediaStream | null) => {
+    if (el && stream) {
+      el.srcObject = stream
+    }
+  }, [])
 
   // Ringtone
   const startRingtone = useCallback(() => {
@@ -113,6 +127,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       peerConnectionRef.current = null
     }
     remoteStreamRef.current = null
+    videoSenderRef.current = null
+    screenAudioSenderRef.current = null
     iceCandidatesQueue.current = []
     setCallDuration(0)
     setIsMuted(false)
@@ -140,11 +156,10 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     }
     const stream = await navigator.mediaDevices.getUserMedia(constraints)
     localStreamRef.current = stream
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = stream
-    }
+    // Attach immediately if element exists; also re-attached later when component mounts
+    attachStream(localVideoRef.current, stream)
     return stream
-  }, [])
+  }, [attachStream])
 
   // Create peer connection with a specific callId (passed explicitly to avoid stale ref)
   const createPeerConnection = useCallback(
@@ -152,9 +167,20 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       const pc = new RTCPeerConnection(ICE_SERVERS)
       peerConnectionRef.current = pc
 
+      // Add tracks and remember the video sender
       stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream)
+        const sender = pc.addTrack(track, stream)
+        if (track.kind === 'video') {
+          videoSenderRef.current = sender
+        }
       })
+
+      // If audio-only call, add a placeholder video transceiver so we can add video later
+      // via replaceTrack without renegotiation
+      if (!stream.getVideoTracks().length) {
+        const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+        videoSenderRef.current = transceiver.sender
+      }
 
       const remoteStream = new MediaStream()
       remoteStreamRef.current = remoteStream
@@ -167,20 +193,14 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
               remoteStream.addTrack(track)
             }
           })
-        } else {
-          // Some browsers deliver tracks without a stream
+        } else if (event.track) {
           if (!remoteStream.getTrackById(event.track.id)) {
             remoteStream.addTrack(event.track)
           }
         }
-        // Attach to the media element if available
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = remoteStream
-        }
-        // Also try the audio ref
-        if (remoteAudioRef.current) {
-          remoteAudioRef.current.srcObject = remoteStream
-        }
+        // Attach to media elements
+        attachStream(remoteVideoRef.current, remoteStream)
+        attachStream(remoteAudioRef.current, remoteStream)
       }
 
       pc.onicecandidate = (event) => {
@@ -195,7 +215,6 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-          // Connection lost — end call
           sendSignal({ type: 'call-end', callId: forCallId })
           stopRingtone()
           cleanupMedia()
@@ -208,9 +227,27 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
         }
       }
 
+      // Handle renegotiation triggered by addTrack / removeTrack
+      pc.onnegotiationneeded = async () => {
+        try {
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          sendSignal({
+            type: 'offer',
+            sdp: pc.localDescription!,
+            callId: forCallId,
+            callerId: currentUserId!,
+            calleeId: '',
+            callType: 'video',
+          })
+        } catch (err) {
+          console.error('Renegotiation failed:', err)
+        }
+      }
+
       return pc
     },
-    [sendSignal, stopRingtone, cleanupMedia]
+    [currentUserId, sendSignal, stopRingtone, cleanupMedia, attachStream]
   )
 
   // Start a call (caller side)
@@ -356,7 +393,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     }
   }, [])
 
-  // Toggle camera (works for video calls — enable/disable existing video track)
+  // Toggle camera on/off for video calls (just enables/disables existing track)
   const toggleCamera = useCallback(() => {
     if (localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0]
@@ -367,23 +404,20 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     }
   }, [])
 
-  // Enable camera mid-call (for audio calls — adds a video track dynamically)
+  // Enable camera mid-call (for audio calls — uses replaceTrack on the pre-allocated video sender)
   const enableCamera = useCallback(async () => {
     const pc = peerConnectionRef.current
-    if (!pc || !localStreamRef.current) return
+    const sender = videoSenderRef.current
+    if (!pc || !localStreamRef.current || !sender) return
 
-    // If already screen sharing, stop it first
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop())
-      screenStreamRef.current = null
-      setIsScreenSharing(false)
+    // If screen sharing, stop it first
+    if (isScreenSharingRef.current) {
+      await stopScreenShareInternal()
     }
 
     try {
       const existingVideoTrack = localStreamRef.current.getVideoTracks()[0]
-
-      if (existingVideoTrack) {
-        // Already has a video track — just toggle it on
+      if (existingVideoTrack && existingVideoTrack.readyState === 'live') {
         existingVideoTrack.enabled = true
         setIsCameraOff(false)
         setHasVideo(true)
@@ -396,58 +430,111 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       })
       const camTrack = camStream.getVideoTracks()[0]
 
-      // Add to local stream
+      // Use replaceTrack — no renegotiation needed
+      await sender.replaceTrack(camTrack)
+
+      // Add to local stream for preview
       localStreamRef.current.addTrack(camTrack)
-
-      // Add to peer connection
-      pc.addTrack(camTrack, localStreamRef.current)
-
-      // Show in local video preview
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current
-      }
+      attachStream(localVideoRef.current, localStreamRef.current)
 
       setHasVideo(true)
       setIsCameraOff(false)
     } catch (err) {
       console.error('Failed to enable camera:', err)
     }
-  }, [])
+  }, [attachStream])
 
-  // Disable camera (remove video track entirely)
-  const disableCamera = useCallback(() => {
-    const pc = peerConnectionRef.current
-    if (!pc || !localStreamRef.current) return
+  // Disable camera (stop track, replace sender with null)
+  const disableCamera = useCallback(async () => {
+    const sender = videoSenderRef.current
+    if (!localStreamRef.current || !sender) return
 
     const videoTrack = localStreamRef.current.getVideoTracks()[0]
     if (videoTrack) {
       videoTrack.stop()
       localStreamRef.current.removeTrack(videoTrack)
-
-      // Remove from peer connection
-      const sender = pc.getSenders().find((s) => s.track === videoTrack)
-      if (sender) {
-        pc.removeTrack(sender)
-      }
     }
+
+    // Replace sender track with null (keeps the transceiver alive for future use)
+    try {
+      await sender.replaceTrack(null)
+    } catch {
+      // Ignore
+    }
+
     setHasVideo(false)
     setIsCameraOff(true)
+  }, [])
+
+  // Internal: stop screen share without toggling state (used by enableCamera)
+  const stopScreenShareInternal = useCallback(async () => {
+    const pc = peerConnectionRef.current
+    const sender = videoSenderRef.current
+    if (!pc || !localStreamRef.current) return
+
+    // Stop screen tracks
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((t) => t.stop())
+      screenStreamRef.current = null
+    }
+
+    // Remove screen audio sender if we added one
+    if (screenAudioSenderRef.current) {
+      try {
+        pc.removeTrack(screenAudioSenderRef.current)
+      } catch {
+        // Ignore
+      }
+      screenAudioSenderRef.current = null
+    }
+
+    // Remove screen video track from local stream
+    const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
+    if (oldVideoTrack) {
+      localStreamRef.current.removeTrack(oldVideoTrack)
+    }
+
+    // Set sender to null
+    if (sender) {
+      try {
+        await sender.replaceTrack(null)
+      } catch {
+        // Ignore
+      }
+    }
+
+    setIsScreenSharing(false)
+    setHasVideo(false)
   }, [])
 
   // Toggle screen share with system audio
   const toggleScreenShare = useCallback(async () => {
     const pc = peerConnectionRef.current
-    if (!pc || !localStreamRef.current) return
+    const sender = videoSenderRef.current
+    if (!pc || !localStreamRef.current || !sender) return
 
-    if (isScreenSharing) {
-      // Stop screen sharing — revert to camera if was a video call, or remove video
+    if (isScreenSharingRef.current) {
+      // --- STOP screen sharing ---
       if (screenStreamRef.current) {
         screenStreamRef.current.getTracks().forEach((t) => t.stop())
         screenStreamRef.current = null
       }
 
-      // Find the screen video sender and replace/remove
-      const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video')
+      // Remove screen audio sender cleanly
+      if (screenAudioSenderRef.current) {
+        try {
+          pc.removeTrack(screenAudioSenderRef.current)
+        } catch {
+          // Ignore
+        }
+        screenAudioSenderRef.current = null
+      }
+
+      // Remove old video track from local stream
+      const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
+      if (oldVideoTrack) {
+        localStreamRef.current.removeTrack(oldVideoTrack)
+      }
 
       // Try to restore camera
       try {
@@ -456,94 +543,69 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
         })
         const camTrack = camStream.getVideoTracks()[0]
 
-        if (videoSender) {
-          await videoSender.replaceTrack(camTrack)
-        }
-
-        // Replace video track in local stream
-        const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
-        if (oldVideoTrack) {
-          localStreamRef.current.removeTrack(oldVideoTrack)
-        }
+        await sender.replaceTrack(camTrack)
         localStreamRef.current.addTrack(camTrack)
-
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current
-        }
+        attachStream(localVideoRef.current, localStreamRef.current)
 
         setHasVideo(true)
         setIsCameraOff(false)
       } catch {
-        // Camera not available — just remove video
-        if (videoSender) {
-          pc.removeTrack(videoSender)
-        }
-        const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
-        if (oldVideoTrack) {
-          oldVideoTrack.stop()
-          localStreamRef.current.removeTrack(oldVideoTrack)
+        // Camera not available — go to no-video state
+        try {
+          await sender.replaceTrack(null)
+        } catch {
+          // Ignore
         }
         setHasVideo(false)
-      }
-
-      // Remove screen audio track from peer connection
-      const audioSenders = pc.getSenders().filter((s) => s.track?.kind === 'audio')
-      // The second audio sender (if any) is the screen audio
-      if (audioSenders.length > 1) {
-        pc.removeTrack(audioSenders[audioSenders.length - 1])
       }
 
       setIsScreenSharing(false)
       return
     }
 
-    // Start screen sharing
+    // --- START screen sharing ---
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: true, // capture system audio
+        audio: true,
       })
       screenStreamRef.current = screenStream
 
       const screenVideoTrack = screenStream.getVideoTracks()[0]
       const screenAudioTrack = screenStream.getAudioTracks()[0]
 
-      // Replace video track in peer connection
-      const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video')
-      if (videoSender) {
-        await videoSender.replaceTrack(screenVideoTrack)
-      } else {
-        pc.addTrack(screenVideoTrack, localStreamRef.current)
-      }
+      // Replace video sender track with screen video (no renegotiation)
+      await sender.replaceTrack(screenVideoTrack)
 
-      // Add screen audio to peer connection (keeps mic audio separate)
+      // Add screen audio as a new track (this IS a new sender, but won't interfere with mic)
       if (screenAudioTrack) {
-        pc.addTrack(screenAudioTrack, screenStream)
+        const audioSender = pc.addTrack(screenAudioTrack, screenStream)
+        screenAudioSenderRef.current = audioSender
       }
 
-      // Replace local stream video track
+      // Stop and replace local video track
       const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
       if (oldVideoTrack) {
         oldVideoTrack.stop()
         localStreamRef.current.removeTrack(oldVideoTrack)
       }
       localStreamRef.current.addTrack(screenVideoTrack)
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current
-      }
+      attachStream(localVideoRef.current, localStreamRef.current)
 
       setIsScreenSharing(true)
       setHasVideo(true)
 
       // When user stops sharing via browser UI
       screenVideoTrack.onended = () => {
-        toggleScreenShare()
+        // Use ref to get fresh state
+        if (isScreenSharingRef.current) {
+          toggleScreenShare()
+        }
       }
     } catch (err) {
       console.error('Failed to start screen sharing:', err)
     }
-  }, [isScreenSharing])
+  }, [attachStream])
 
   // Subscribe to signaling channel — uses refs so no re-subscription on state changes
   useEffect(() => {
@@ -557,6 +619,24 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
 
         switch (signal.type) {
           case 'offer': {
+            // If we are already in a call and receive a new offer, it's a renegotiation
+            if (callStateRef.current === 'active' && signal.callId === callIdRef.current && peerConnectionRef.current) {
+              try {
+                const pc = peerConnectionRef.current
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+                const answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                channel.send({
+                  type: 'broadcast',
+                  event: 'webrtc-signal',
+                  payload: { type: 'answer', sdp: answer, callId: signal.callId },
+                })
+              } catch (err) {
+                console.error('Renegotiation answer failed:', err)
+              }
+              return
+            }
+
             if (signal.calleeId !== currentUserId) return
             if (callStateRef.current !== 'idle') {
               // Busy — auto-decline
@@ -590,21 +670,25 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
           case 'answer': {
             if (signal.callId !== callIdRef.current || !peerConnectionRef.current) return
 
-            stopRingtone()
-            setCallState('active')
+            const pc = peerConnectionRef.current
+            // Only set remote description if we're in a state that expects an answer
+            if (pc.signalingState === 'have-local-offer') {
+              stopRingtone()
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
 
-            await peerConnectionRef.current.setRemoteDescription(
-              new RTCSessionDescription(signal.sdp)
-            )
+              for (const candidate of iceCandidatesQueue.current) {
+                await pc.addIceCandidate(new RTCIceCandidate(candidate))
+              }
+              iceCandidatesQueue.current = []
 
-            for (const candidate of iceCandidatesQueue.current) {
-              await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate))
+              // Only start timer if not already active (first answer)
+              if (callStateRef.current !== 'active') {
+                setCallState('active')
+                durationIntervalRef.current = setInterval(() => {
+                  setCallDuration((prev) => prev + 1)
+                }, 1000)
+              }
             }
-            iceCandidatesQueue.current = []
-
-            durationIntervalRef.current = setInterval(() => {
-              setCallDuration((prev) => prev + 1)
-            }, 1000)
             break
           }
 
@@ -668,6 +752,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     remoteVideoRef,
     remoteAudioRef,
     remoteStream: remoteStreamRef,
+    localStream: localStreamRef,
     startCall,
     answerCall,
     declineCall,
