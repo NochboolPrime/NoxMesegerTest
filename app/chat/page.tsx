@@ -137,6 +137,8 @@ export default function ChatPage() {
           remoteUser={remoteUserProfile}
           isMuted={webrtc.isMuted}
           isCameraOff={webrtc.isCameraOff}
+          isScreenSharing={webrtc.isScreenSharing}
+          hasVideo={webrtc.hasVideo}
           callDuration={webrtc.callDuration}
           localVideoRef={webrtc.localVideoRef}
           remoteVideoRef={webrtc.remoteVideoRef}
@@ -144,6 +146,9 @@ export default function ChatPage() {
           remoteStream={webrtc.remoteStream}
           onToggleMute={webrtc.toggleMute}
           onToggleCamera={webrtc.toggleCamera}
+          onEnableCamera={webrtc.enableCamera}
+          onDisableCamera={webrtc.disableCamera}
+          onToggleScreenShare={webrtc.toggleScreenShare}
           onEndCall={webrtc.endCall}
         />
       )}

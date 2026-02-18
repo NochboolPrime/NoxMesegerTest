@@ -27,6 +27,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
   const [remoteUserId, setRemoteUserId] = useState<string | null>(null)
   const [isMuted, setIsMuted] = useState(false)
   const [isCameraOff, setIsCameraOff] = useState(false)
+  const [isScreenSharing, setIsScreenSharing] = useState(false)
+  const [hasVideo, setHasVideo] = useState(false)
   const [callDuration, setCallDuration] = useState(0)
 
   // Refs for mutable state to avoid stale closures in the signal handler
@@ -35,6 +37,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
+  const screenStreamRef = useRef<MediaStream | null>(null)
   const remoteStreamRef = useRef<MediaStream | null>(null)
   const localVideoRef = useRef<HTMLVideoElement | null>(null)
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
@@ -101,6 +104,10 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       localStreamRef.current.getTracks().forEach((t) => t.stop())
       localStreamRef.current = null
     }
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((t) => t.stop())
+      screenStreamRef.current = null
+    }
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close()
       peerConnectionRef.current = null
@@ -110,6 +117,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     setCallDuration(0)
     setIsMuted(false)
     setIsCameraOff(false)
+    setIsScreenSharing(false)
+    setHasVideo(false)
   }, [stopRingtone])
 
   // Send signal via Supabase Realtime broadcast
@@ -213,6 +222,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
         setCallType(type)
         setRemoteUserId(targetUserId)
         setCallState('calling')
+        setHasVideo(type === 'video')
 
         const newCallId = crypto.randomUUID()
         setCallId(newCallId)
@@ -346,7 +356,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     }
   }, [])
 
-  // Toggle camera
+  // Toggle camera (works for video calls — enable/disable existing video track)
   const toggleCamera = useCallback(() => {
     if (localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0]
@@ -356,6 +366,184 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
       }
     }
   }, [])
+
+  // Enable camera mid-call (for audio calls — adds a video track dynamically)
+  const enableCamera = useCallback(async () => {
+    const pc = peerConnectionRef.current
+    if (!pc || !localStreamRef.current) return
+
+    // If already screen sharing, stop it first
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((t) => t.stop())
+      screenStreamRef.current = null
+      setIsScreenSharing(false)
+    }
+
+    try {
+      const existingVideoTrack = localStreamRef.current.getVideoTracks()[0]
+
+      if (existingVideoTrack) {
+        // Already has a video track — just toggle it on
+        existingVideoTrack.enabled = true
+        setIsCameraOff(false)
+        setHasVideo(true)
+        return
+      }
+
+      // Get a camera stream
+      const camStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' },
+      })
+      const camTrack = camStream.getVideoTracks()[0]
+
+      // Add to local stream
+      localStreamRef.current.addTrack(camTrack)
+
+      // Add to peer connection
+      pc.addTrack(camTrack, localStreamRef.current)
+
+      // Show in local video preview
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current
+      }
+
+      setHasVideo(true)
+      setIsCameraOff(false)
+    } catch (err) {
+      console.error('Failed to enable camera:', err)
+    }
+  }, [])
+
+  // Disable camera (remove video track entirely)
+  const disableCamera = useCallback(() => {
+    const pc = peerConnectionRef.current
+    if (!pc || !localStreamRef.current) return
+
+    const videoTrack = localStreamRef.current.getVideoTracks()[0]
+    if (videoTrack) {
+      videoTrack.stop()
+      localStreamRef.current.removeTrack(videoTrack)
+
+      // Remove from peer connection
+      const sender = pc.getSenders().find((s) => s.track === videoTrack)
+      if (sender) {
+        pc.removeTrack(sender)
+      }
+    }
+    setHasVideo(false)
+    setIsCameraOff(true)
+  }, [])
+
+  // Toggle screen share with system audio
+  const toggleScreenShare = useCallback(async () => {
+    const pc = peerConnectionRef.current
+    if (!pc || !localStreamRef.current) return
+
+    if (isScreenSharing) {
+      // Stop screen sharing — revert to camera if was a video call, or remove video
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((t) => t.stop())
+        screenStreamRef.current = null
+      }
+
+      // Find the screen video sender and replace/remove
+      const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video')
+
+      // Try to restore camera
+      try {
+        const camStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' },
+        })
+        const camTrack = camStream.getVideoTracks()[0]
+
+        if (videoSender) {
+          await videoSender.replaceTrack(camTrack)
+        }
+
+        // Replace video track in local stream
+        const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
+        if (oldVideoTrack) {
+          localStreamRef.current.removeTrack(oldVideoTrack)
+        }
+        localStreamRef.current.addTrack(camTrack)
+
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStreamRef.current
+        }
+
+        setHasVideo(true)
+        setIsCameraOff(false)
+      } catch {
+        // Camera not available — just remove video
+        if (videoSender) {
+          pc.removeTrack(videoSender)
+        }
+        const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
+        if (oldVideoTrack) {
+          oldVideoTrack.stop()
+          localStreamRef.current.removeTrack(oldVideoTrack)
+        }
+        setHasVideo(false)
+      }
+
+      // Remove screen audio track from peer connection
+      const audioSenders = pc.getSenders().filter((s) => s.track?.kind === 'audio')
+      // The second audio sender (if any) is the screen audio
+      if (audioSenders.length > 1) {
+        pc.removeTrack(audioSenders[audioSenders.length - 1])
+      }
+
+      setIsScreenSharing(false)
+      return
+    }
+
+    // Start screen sharing
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true, // capture system audio
+      })
+      screenStreamRef.current = screenStream
+
+      const screenVideoTrack = screenStream.getVideoTracks()[0]
+      const screenAudioTrack = screenStream.getAudioTracks()[0]
+
+      // Replace video track in peer connection
+      const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video')
+      if (videoSender) {
+        await videoSender.replaceTrack(screenVideoTrack)
+      } else {
+        pc.addTrack(screenVideoTrack, localStreamRef.current)
+      }
+
+      // Add screen audio to peer connection (keeps mic audio separate)
+      if (screenAudioTrack) {
+        pc.addTrack(screenAudioTrack, screenStream)
+      }
+
+      // Replace local stream video track
+      const oldVideoTrack = localStreamRef.current.getVideoTracks()[0]
+      if (oldVideoTrack) {
+        oldVideoTrack.stop()
+        localStreamRef.current.removeTrack(oldVideoTrack)
+      }
+      localStreamRef.current.addTrack(screenVideoTrack)
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStreamRef.current
+      }
+
+      setIsScreenSharing(true)
+      setHasVideo(true)
+
+      // When user stops sharing via browser UI
+      screenVideoTrack.onended = () => {
+        toggleScreenShare()
+      }
+    } catch (err) {
+      console.error('Failed to start screen sharing:', err)
+    }
+  }, [isScreenSharing])
 
   // Subscribe to signaling channel — uses refs so no re-subscription on state changes
   useEffect(() => {
@@ -383,6 +571,7 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
             setCallId(signal.callId)
             setRemoteUserId(signal.callerId)
             setCallType(signal.callType)
+            setHasVideo(signal.callType === 'video')
             setCallState('ringing')
 
             try {
@@ -472,6 +661,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     remoteUserId,
     isMuted,
     isCameraOff,
+    isScreenSharing,
+    hasVideo,
     callDuration,
     localVideoRef,
     remoteVideoRef,
@@ -483,5 +674,8 @@ export function useWebRTC({ currentUserId, conversationId }: UseWebRTCProps) {
     endCall,
     toggleMute,
     toggleCamera,
+    enableCamera,
+    disableCamera,
+    toggleScreenShare,
   }
 }

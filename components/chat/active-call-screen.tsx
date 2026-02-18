@@ -3,7 +3,7 @@
 import { useEffect } from 'react'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
-import { Mic, MicOff, VideoIcon, VideoOff, PhoneOff } from 'lucide-react'
+import { Mic, MicOff, VideoIcon, VideoOff, PhoneOff, Monitor, MonitorOff } from 'lucide-react'
 import type { Profile } from '@/lib/types'
 import type { CallState } from '@/hooks/use-webrtc'
 import type { RefObject, MutableRefObject } from 'react'
@@ -14,6 +14,8 @@ interface ActiveCallScreenProps {
   remoteUser: Profile | null
   isMuted: boolean
   isCameraOff: boolean
+  isScreenSharing: boolean
+  hasVideo: boolean
   callDuration: number
   localVideoRef: RefObject<HTMLVideoElement | null>
   remoteVideoRef: RefObject<HTMLVideoElement | null>
@@ -21,6 +23,9 @@ interface ActiveCallScreenProps {
   remoteStream: MutableRefObject<MediaStream | null>
   onToggleMute: () => void
   onToggleCamera: () => void
+  onEnableCamera: () => void
+  onDisableCamera: () => void
+  onToggleScreenShare: () => void
   onEndCall: () => void
 }
 
@@ -30,6 +35,8 @@ export function ActiveCallScreen({
   remoteUser,
   isMuted,
   isCameraOff,
+  isScreenSharing,
+  hasVideo,
   callDuration,
   localVideoRef,
   remoteVideoRef,
@@ -37,10 +44,12 @@ export function ActiveCallScreen({
   remoteStream,
   onToggleMute,
   onToggleCamera,
+  onEnableCamera,
+  onDisableCamera,
+  onToggleScreenShare,
   onEndCall,
 }: ActiveCallScreenProps) {
   // Re-attach remote stream to media elements when the component mounts or call becomes active.
-  // This fixes the issue where ontrack fires before the DOM elements exist.
   useEffect(() => {
     const stream = remoteStream.current
     if (!stream) return
@@ -52,6 +61,7 @@ export function ActiveCallScreen({
       remoteAudioRef.current.srcObject = stream
     }
   }, [callState, remoteStream, remoteVideoRef, remoteAudioRef])
+
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)
     const s = seconds % 60
@@ -81,11 +91,29 @@ export function ActiveCallScreen({
     }
   }
 
+  // Determine if we should show the video layout
+  const showVideoLayout = hasVideo
+
+  const handleCameraToggle = () => {
+    if (hasVideo) {
+      // If this was originally a video call, just toggle the track
+      if (callType === 'video') {
+        onToggleCamera()
+      } else {
+        // Audio call with camera enabled — disable camera entirely
+        onDisableCamera()
+      }
+    } else {
+      // No video — enable camera
+      onEnableCamera()
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-background">
       {/* Main area */}
       <div className="relative flex flex-1 items-center justify-center">
-        {callType === 'video' ? (
+        {showVideoLayout ? (
           <>
             {/* Remote video (full screen) */}
             <video
@@ -105,11 +133,16 @@ export function ActiveCallScreen({
                 playsInline
                 muted
                 className="h-40 w-28 object-cover"
-                style={{ transform: 'scaleX(-1)' }}
+                style={{ transform: isScreenSharing ? 'none' : 'scaleX(-1)' }}
               />
-              {isCameraOff && (
+              {isCameraOff && !isScreenSharing && (
                 <div className="absolute inset-0 flex items-center justify-center bg-secondary">
                   <VideoOff className="h-6 w-6 text-muted-foreground" />
+                </div>
+              )}
+              {isScreenSharing && (
+                <div className="absolute bottom-1 left-1 right-1 rounded bg-primary/80 px-1 py-0.5 text-center text-xs text-primary-foreground">
+                  Screen
                 </div>
               )}
             </div>
@@ -156,7 +189,8 @@ export function ActiveCallScreen({
       </div>
 
       {/* Controls */}
-      <div className="flex items-center justify-center gap-6 bg-card/80 p-6 backdrop-blur-sm border-t border-border">
+      <div className="flex items-center justify-center gap-4 bg-card/80 p-6 backdrop-blur-sm border-t border-border">
+        {/* Mute button */}
         <Button
           onClick={onToggleMute}
           variant="outline"
@@ -171,26 +205,43 @@ export function ActiveCallScreen({
           <span className="sr-only">{isMuted ? 'Unmute' : 'Mute'}</span>
         </Button>
 
-        {callType === 'video' && (
+        {/* Camera button — always visible */}
+        <Button
+          onClick={handleCameraToggle}
+          variant="outline"
+          size="lg"
+          className={`h-14 w-14 rounded-full ${
+            !hasVideo || isCameraOff
+              ? 'bg-destructive/20 border-destructive text-destructive hover:bg-destructive/30 hover:text-destructive'
+              : 'bg-secondary border-border text-foreground hover:bg-secondary/80'
+          }`}
+        >
+          {!hasVideo || isCameraOff ? (
+            <VideoOff className="h-5 w-5" />
+          ) : (
+            <VideoIcon className="h-5 w-5" />
+          )}
+          <span className="sr-only">{hasVideo && !isCameraOff ? 'Turn off camera' : 'Turn on camera'}</span>
+        </Button>
+
+        {/* Screen share button — only during active call */}
+        {callState === 'active' && (
           <Button
-            onClick={onToggleCamera}
+            onClick={onToggleScreenShare}
             variant="outline"
             size="lg"
             className={`h-14 w-14 rounded-full ${
-              isCameraOff
-                ? 'bg-destructive/20 border-destructive text-destructive hover:bg-destructive/30 hover:text-destructive'
+              isScreenSharing
+                ? 'bg-primary/20 border-primary text-primary hover:bg-primary/30 hover:text-primary'
                 : 'bg-secondary border-border text-foreground hover:bg-secondary/80'
             }`}
           >
-            {isCameraOff ? (
-              <VideoOff className="h-5 w-5" />
-            ) : (
-              <VideoIcon className="h-5 w-5" />
-            )}
-            <span className="sr-only">{isCameraOff ? 'Turn on camera' : 'Turn off camera'}</span>
+            {isScreenSharing ? <MonitorOff className="h-5 w-5" /> : <Monitor className="h-5 w-5" />}
+            <span className="sr-only">{isScreenSharing ? 'Stop sharing' : 'Share screen'}</span>
           </Button>
         )}
 
+        {/* End call button */}
         <Button
           onClick={onEndCall}
           size="lg"
