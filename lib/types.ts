@@ -36,6 +36,34 @@ export interface ConversationWithDetails {
   other_user: Profile
   last_message: Message | null
   unread_count: number
+  is_group?: boolean
+  name?: string | null
+  avatar_url?: string | null
+  created_by?: string | null
+  participants?: Profile[]
+  member_count?: number
+}
+
+export interface GroupCall {
+  id: string
+  conversation_id: string
+  started_by: string
+  type: 'audio' | 'video'
+  status: 'active' | 'ended'
+  started_at: string | null
+  ended_at: string | null
+  created_at: string
+}
+
+export interface GroupCallParticipant {
+  id: string
+  call_id: string
+  user_id: string
+  joined_at: string
+  left_at: string | null
+  is_muted: boolean
+  is_camera_off: boolean
+  is_screen_sharing: boolean
 }
 
 export interface Call {
@@ -56,3 +84,10 @@ export type WebRTCSignal =
   | { type: 'ice-candidate'; candidate: RTCIceCandidateInit; callId: string }
   | { type: 'call-end'; callId: string }
   | { type: 'call-decline'; callId: string }
+
+export type GroupWebRTCSignal =
+  | { type: 'group-offer'; sdp: RTCSessionDescriptionInit; callId: string; fromUserId: string; toUserId: string }
+  | { type: 'group-answer'; sdp: RTCSessionDescriptionInit; callId: string; fromUserId: string; toUserId: string }
+  | { type: 'group-ice-candidate'; candidate: RTCIceCandidateInit; callId: string; fromUserId: string; toUserId: string }
+  | { type: 'group-join'; callId: string; userId: string }
+  | { type: 'group-leave'; callId: string; userId: string }

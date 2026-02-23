@@ -4,16 +4,20 @@ import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { ChatSidebar } from '@/components/chat/chat-sidebar'
 import { ChatArea } from '@/components/chat/chat-area'
+import { GroupChatArea } from '@/components/chat/group-chat-area'
 import { ProfilePanel } from '@/components/chat/profile-panel'
 import { SearchUsersPanel } from '@/components/chat/search-users-panel'
 import { IncomingCallOverlay } from '@/components/chat/incoming-call-overlay'
 import { ActiveCallScreen } from '@/components/chat/active-call-screen'
+import { GroupCallScreen } from '@/components/chat/group-call-screen'
 import { useWebRTC } from '@/hooks/use-webrtc'
-import type { Profile } from '@/lib/types'
+import { useGroupWebRTC } from '@/hooks/use-group-webrtc'
+import type { Profile, GroupCall } from '@/lib/types'
 
 export default function ChatPage() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
   const [otherUserId, setOtherUserId] = useState<string | null>(null)
+  const [isGroupConversation, setIsGroupConversation] = useState(false)
   const [showProfile, setShowProfile] = useState(false)
   const [showSearch, setShowSearch] = useState(false)
   const [sidebarKey, setSidebarKey] = useState(0)
@@ -22,7 +26,14 @@ export default function ChatPage() {
 
   const supabase = createClient()
 
+  // 1:1 WebRTC
   const webrtc = useWebRTC({
+    currentUserId,
+    conversationId: activeConversationId,
+  })
+
+  // Group WebRTC
+  const groupWebrtc = useGroupWebRTC({
     currentUserId,
     conversationId: activeConversationId,
   })
@@ -36,7 +47,7 @@ export default function ChatPage() {
     getUser()
   }, [supabase])
 
-  // Load remote user profile when call comes in
+  // Load remote user profile when 1:1 call comes in
   const loadRemoteProfile = useCallback(async (userId: string) => {
     const { data } = await supabase
       .from('profiles')
@@ -52,9 +63,20 @@ export default function ChatPage() {
     }
   }, [webrtc.remoteUserId, loadRemoteProfile])
 
+  // Select 1:1 conversation
   const handleSelectConversation = (conversationId: string, userId: string) => {
     setActiveConversationId(conversationId)
     setOtherUserId(userId)
+    setIsGroupConversation(false)
+    setShowProfile(false)
+    setShowSearch(false)
+  }
+
+  // Select group conversation
+  const handleSelectGroupConversation = (conversationId: string) => {
+    setActiveConversationId(conversationId)
+    setOtherUserId(null)
+    setIsGroupConversation(true)
     setShowProfile(false)
     setShowSearch(false)
   }
@@ -62,17 +84,29 @@ export default function ChatPage() {
   const handleStartConversation = (conversationId: string, userId: string) => {
     setActiveConversationId(conversationId)
     setOtherUserId(userId)
+    setIsGroupConversation(false)
     setShowSearch(false)
     setSidebarKey((prev) => prev + 1)
   }
 
+  // 1:1 call
   const handleStartCall = (type: 'audio' | 'video') => {
     if (otherUserId) {
       webrtc.startCall(otherUserId, type)
     }
   }
 
-  // Update document title with unread indicator
+  // Group call - start new
+  const handleStartGroupCall = (type: 'audio' | 'video') => {
+    groupWebrtc.startGroupCall(type)
+  }
+
+  // Group call - join existing
+  const handleJoinGroupCall = (call: GroupCall) => {
+    groupWebrtc.joinGroupCall(call)
+  }
+
+  // Update document title
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -83,12 +117,15 @@ export default function ChatPage() {
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [])
 
+  const isInAnyCall = webrtc.callState !== 'idle' || groupWebrtc.groupCallState !== 'idle'
+
   return (
     <div className="flex h-svh w-full overflow-hidden bg-background">
       <ChatSidebar
         key={sidebarKey}
         activeConversationId={activeConversationId}
         onSelectConversation={handleSelectConversation}
+        onSelectGroupConversation={handleSelectGroupConversation}
         onShowProfile={() => { setShowProfile(true); setShowSearch(false) }}
         onShowSearch={() => { setShowSearch(true); setShowProfile(false) }}
       />
@@ -100,13 +137,21 @@ export default function ChatPage() {
           onClose={() => setShowSearch(false)}
           onStartConversation={handleStartConversation}
         />
+      ) : activeConversationId && isGroupConversation ? (
+        <GroupChatArea
+          key={activeConversationId}
+          conversationId={activeConversationId}
+          onStartGroupCall={handleStartGroupCall}
+          onJoinGroupCall={handleJoinGroupCall}
+          isInCall={isInAnyCall}
+        />
       ) : activeConversationId && otherUserId ? (
         <ChatArea
           key={activeConversationId}
           conversationId={activeConversationId}
           otherUserId={otherUserId}
           onStartCall={handleStartCall}
-          isInCall={webrtc.callState !== 'idle'}
+          isInCall={isInAnyCall}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center bg-background">
@@ -119,7 +164,7 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* Incoming call overlay */}
+      {/* Incoming 1:1 call overlay */}
       {webrtc.callState === 'ringing' && (
         <IncomingCallOverlay
           caller={remoteUserProfile}
@@ -129,7 +174,7 @@ export default function ChatPage() {
         />
       )}
 
-      {/* Active call / Calling screen */}
+      {/* Active 1:1 call screen */}
       {(webrtc.callState === 'calling' || webrtc.callState === 'active' || webrtc.callState === 'ended') && (
         <ActiveCallScreen
           callState={webrtc.callState}
@@ -151,6 +196,25 @@ export default function ChatPage() {
           onDisableCamera={webrtc.disableCamera}
           onToggleScreenShare={webrtc.toggleScreenShare}
           onEndCall={webrtc.endCall}
+        />
+      )}
+
+      {/* Active group call screen */}
+      {(groupWebrtc.groupCallState === 'joining' || groupWebrtc.groupCallState === 'active') && (
+        <GroupCallScreen
+          callState={groupWebrtc.groupCallState}
+          callType={groupWebrtc.groupCallType}
+          isMuted={groupWebrtc.isMuted}
+          isCameraOff={groupWebrtc.isCameraOff}
+          isScreenSharing={groupWebrtc.isScreenSharing}
+          peers={groupWebrtc.peers}
+          callDuration={groupWebrtc.callDuration}
+          localStream={groupWebrtc.localStream}
+          localVideoRef={groupWebrtc.localVideoRef}
+          onToggleMute={groupWebrtc.toggleMute}
+          onToggleCamera={groupWebrtc.toggleCamera}
+          onToggleScreenShare={groupWebrtc.toggleScreenShare}
+          onLeaveCall={groupWebrtc.leaveGroupCall}
         />
       )}
     </div>
