@@ -48,7 +48,12 @@ function ParticipantTile({
   const audioRef = useRef<HTMLAudioElement>(null)
   const [hasVideo, setHasVideo] = useState(false)
 
-  // Always attach stream to both elements and check for video tracks
+  // Determine if peer has video based on their reported media state
+  // This is more reliable than checking track.readyState because replaceTrack
+  // doesn't change the receiver track's readyState
+  const peerReportsVideo = !peer.isCameraOff || peer.isScreenSharing
+
+  // Attach stream and detect video
   useEffect(() => {
     const stream = peer.stream
     if (!stream) {
@@ -63,14 +68,16 @@ function ParticipantTile({
       audioRef.current.srcObject = stream
     }
 
-    // Check if the stream has active video tracks
+    // Check if the stream has video tracks
     const videoTracks = stream.getVideoTracks()
-    // A track is usable if it exists and is enabled; readyState 'live' is sufficient
-    // (the track may be in 'muted' state initially but will unmute shortly)
-    const activeVideo = videoTracks.length > 0 && videoTracks.some((t) => t.enabled && t.readyState === 'live')
+    const hasVideoTrack = videoTracks.length > 0
+
+    // Use peer's reported state as primary signal, track existence as secondary
+    const activeVideo = hasVideoTrack && peerReportsVideo
     setHasVideo(activeVideo)
 
-    // Always attach to video element when there are video tracks
+    // Always attach stream to video element when peer reports having video
+    // so the video element is ready to display frames
     if (videoRef.current) {
       if (activeVideo) {
         videoRef.current.srcObject = stream
@@ -78,7 +85,7 @@ function ParticipantTile({
         videoRef.current.srcObject = null
       }
     }
-  }, [peer.stream, streamVersion])
+  }, [peer.stream, peerReportsVideo, streamVersion])
 
   const getInitials = (name: string | null) => {
     if (!name) return '?'
@@ -164,21 +171,19 @@ function FullscreenVideoOverlay({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
+  const peerHasVideo = peer.stream &&
+    peer.stream.getVideoTracks().length > 0 &&
+    (!peer.isCameraOff || peer.isScreenSharing)
+
   useEffect(() => {
     if (videoRef.current) {
-      if (peer.stream) {
-        const videoTracks = peer.stream.getVideoTracks()
-        const hasActiveVideo = videoTracks.length > 0 && videoTracks.some((t) => t.enabled && t.readyState === 'live')
-        if (hasActiveVideo) {
-          videoRef.current.srcObject = peer.stream
-        } else {
-          videoRef.current.srcObject = null
-        }
+      if (peerHasVideo && peer.stream) {
+        videoRef.current.srcObject = peer.stream
       } else {
         videoRef.current.srcObject = null
       }
     }
-  }, [peer.stream, streamVersion])
+  }, [peer.stream, peerHasVideo, streamVersion])
 
   const getInitials = (name: string | null) => {
     if (!name) return '?'
@@ -204,7 +209,7 @@ function FullscreenVideoOverlay({
       </div>
 
       <div className="flex-1 flex items-center justify-center p-4">
-        {peer.stream && peer.stream.getVideoTracks().some((t) => t.enabled && t.readyState === 'live') ? (
+        {peerHasVideo ? (
           <video
             ref={videoRef}
             autoPlay
