@@ -209,6 +209,7 @@ export default function ChatPage() {
           isScreenSharing={groupWebrtc.isScreenSharing}
           peers={groupWebrtc.peers}
           callDuration={groupWebrtc.callDuration}
+          streamVersion={groupWebrtc.streamVersion}
           localStream={groupWebrtc.localStream}
           localVideoRef={groupWebrtc.localVideoRef}
           onToggleMute={groupWebrtc.toggleMute}

@@ -44,6 +44,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  // Use a single stable MediaStream per peer; we add/remove tracks on it directly
   const peerStreamsRef = useRef<Map<string, MediaStream>>(new Map())
   const channelRef = useRef<RealtimeChannel | null>(null)
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -138,6 +139,24 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
     }
   }, [])
 
+  // Helper: update peer stream in state — always reads from the ref so we have a single source of truth
+  const updatePeerStream = useCallback((remoteUserId: string) => {
+    const stream = peerStreamsRef.current.get(remoteUserId)
+    if (!stream) return
+
+    setPeers((prev) => {
+      const updated = new Map(prev)
+      const existing = updated.get(remoteUserId)
+      if (existing) {
+        // Set the same MediaStream object so the <video> element stays attached,
+        // but spread to trigger React re-render
+        updated.set(remoteUserId, { ...existing, stream })
+      }
+      return updated
+    })
+    setStreamVersion((v) => v + 1)
+  }, [])
+
   // Create a peer connection for a specific remote user
   const createPeerConnectionForUser = useCallback(
     (remoteUserId: string, callId: string) => {
@@ -169,41 +188,34 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         transceiver.sender.replaceTrack(currentVideoTrack)
       }
 
-      // Handle remote tracks
+      // Create ONE stable MediaStream per peer — we will add/remove tracks on it
       const remoteStream = new MediaStream()
       peerStreamsRef.current.set(remoteUserId, remoteStream)
 
       pc.ontrack = (event) => {
         const track = event.track
+        // Always get the CURRENT stream from the ref (single source of truth)
+        const currentStream = peerStreamsRef.current.get(remoteUserId)
+        if (!currentStream) return
 
         // Remove any existing track of the same kind before adding new one
-        remoteStream.getTracks().forEach((t) => {
+        currentStream.getTracks().forEach((t) => {
           if (t.kind === track.kind && t.id !== track.id) {
-            remoteStream.removeTrack(t)
+            currentStream.removeTrack(t)
           }
         })
 
-        if (!remoteStream.getTrackById(track.id)) {
-          remoteStream.addTrack(track)
+        if (!currentStream.getTrackById(track.id)) {
+          currentStream.addTrack(track)
         }
 
-        // Listen for track unmute / ended to trigger re-render
-        track.onunmute = () => setStreamVersion((v) => v + 1)
-        track.onended = () => setStreamVersion((v) => v + 1)
+        // Listen for track state changes to trigger re-render
+        track.onunmute = () => updatePeerStream(remoteUserId)
+        track.onended = () => updatePeerStream(remoteUserId)
+        track.onmute = () => updatePeerStream(remoteUserId)
 
         // Force UI update
-        setPeers((prev) => {
-          const updated = new Map(prev)
-          const existing = updated.get(remoteUserId)
-          if (existing) {
-            // Create a new MediaStream wrapper so React sees a new reference
-            const freshStream = new MediaStream(remoteStream.getTracks())
-            peerStreamsRef.current.set(remoteUserId, freshStream)
-            updated.set(remoteUserId, { ...existing, stream: freshStream })
-          }
-          return updated
-        })
-        setStreamVersion((v) => v + 1)
+        updatePeerStream(remoteUserId)
       }
 
       // ICE candidates
@@ -234,7 +246,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
       return pc
     },
-    [currentUserId, sendSignal]
+    [currentUserId, sendSignal, updatePeerStream]
   )
 
   // Handle incoming signal
@@ -379,6 +391,24 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
           })
           break
         }
+
+        case 'group-media-state': {
+          // Update peer's media state (camera/mute/screen share)
+          setPeers((prev) => {
+            const updated = new Map(prev)
+            const existing = updated.get(signal.userId)
+            if (existing) {
+              updated.set(signal.userId, {
+                ...existing,
+                isMuted: signal.isMuted,
+                isCameraOff: signal.isCameraOff,
+                isScreenSharing: signal.isScreenSharing,
+              })
+            }
+            return updated
+          })
+          break
+        }
       }
     },
     [currentUserId, createPeerConnectionForUser, sendSignal, loadPeerProfile, flushPendingCandidates]
@@ -406,6 +436,19 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       channelRef.current = null
     }
   }, [conversationId, currentUserId, supabase, handleSignal])
+
+  // Broadcast our media state to all peers
+  const broadcastMediaState = useCallback((newMuted: boolean, newCameraOff: boolean, newScreenSharing: boolean) => {
+    if (!currentUserId || !groupCallIdRef.current) return
+    sendSignal({
+      type: 'group-media-state',
+      callId: groupCallIdRef.current,
+      userId: currentUserId,
+      isMuted: newMuted,
+      isCameraOff: newCameraOff,
+      isScreenSharing: newScreenSharing,
+    })
+  }, [currentUserId, sendSignal])
 
   // Start a new group call
   const startGroupCall = useCallback(
@@ -569,10 +612,12 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       const audioTrack = localStreamRef.current.getAudioTracks()[0]
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled
-        setIsMuted(!audioTrack.enabled)
+        const newMuted = !audioTrack.enabled
+        setIsMuted(newMuted)
+        broadcastMediaState(newMuted, isCameraOff, isScreenSharing)
       }
     }
-  }, [])
+  }, [isCameraOff, isScreenSharing, broadcastMediaState])
 
   // Helper: replace video track on ALL peer connections via dedicated video sender
   const replaceVideoTrackOnAllPeers = useCallback((track: MediaStreamTrack | null) => {
@@ -611,6 +656,8 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         }
 
         setIsCameraOff(false)
+        setStreamVersion((v) => v + 1)
+        broadcastMediaState(isMuted, false, isScreenSharing)
       } catch (err) {
         console.error('Failed to enable camera:', err)
       }
@@ -630,8 +677,10 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         localVideoRef.current.srcObject = null
       }
       setIsCameraOff(true)
+      setStreamVersion((v) => v + 1)
+      broadcastMediaState(isMuted, true, isScreenSharing)
     }
-  }, [isCameraOff, replaceVideoTrackOnAllPeers])
+  }, [isCameraOff, isMuted, isScreenSharing, replaceVideoTrackOnAllPeers, broadcastMediaState])
 
   // Toggle screen share
   const toggleScreenShare = useCallback(async () => {
@@ -642,20 +691,52 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         screenStreamRef.current = null
       }
 
-      // Replace with camera track or null
-      const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null
-      replaceVideoTrackOnAllPeers(cameraTrack)
+      // If camera was on before, try to restore it
+      if (!isCameraOff) {
+        try {
+          const camStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 640, height: 480, facingMode: 'user' },
+          })
+          const camTrack = camStream.getVideoTracks()[0]
 
-      // Update local preview
-      if (localVideoRef.current) {
-        if (cameraTrack && localStreamRef.current) {
-          localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
-        } else {
+          // Replace screen track with camera on local stream
+          if (localStreamRef.current) {
+            localStreamRef.current.getVideoTracks().forEach((t) => {
+              t.stop()
+              localStreamRef.current?.removeTrack(t)
+            })
+            localStreamRef.current.addTrack(camTrack)
+          }
+
+          replaceVideoTrackOnAllPeers(camTrack)
+
+          if (localVideoRef.current && localStreamRef.current) {
+            localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
+          }
+        } catch {
+          // Camera not available, go to no-video state
+          replaceVideoTrackOnAllPeers(null)
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = null
+          }
+        }
+      } else {
+        // Camera was off, just remove screen track
+        if (localStreamRef.current) {
+          localStreamRef.current.getVideoTracks().forEach((t) => {
+            t.stop()
+            localStreamRef.current?.removeTrack(t)
+          })
+        }
+        replaceVideoTrackOnAllPeers(null)
+        if (localVideoRef.current) {
           localVideoRef.current.srcObject = null
         }
       }
 
       setIsScreenSharing(false)
+      setStreamVersion((v) => v + 1)
+      broadcastMediaState(isMuted, isCameraOff, false)
     } else {
       try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -675,26 +756,26 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         // Handle screen share ending (user clicks browser stop)
         screenTrack.onended = () => {
           screenStreamRef.current = null
-          const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null
-          replaceVideoTrackOnAllPeers(cameraTrack)
+          // When browser stops screen share, camera was off or needs re-acquire
+          replaceVideoTrackOnAllPeers(null)
 
           if (localVideoRef.current) {
-            if (cameraTrack && localStreamRef.current) {
-              localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
-            } else {
-              localVideoRef.current.srcObject = null
-            }
+            localVideoRef.current.srcObject = null
           }
 
           setIsScreenSharing(false)
+          setStreamVersion((v) => v + 1)
+          broadcastMediaState(isMuted, isCameraOff, false)
         }
 
         setIsScreenSharing(true)
+        setStreamVersion((v) => v + 1)
+        broadcastMediaState(isMuted, isCameraOff, true)
       } catch {
         // User cancelled screen share
       }
     }
-  }, [isScreenSharing, replaceVideoTrackOnAllPeers])
+  }, [isScreenSharing, isMuted, isCameraOff, replaceVideoTrackOnAllPeers, broadcastMediaState])
 
   // Cleanup on unmount
   useEffect(() => {

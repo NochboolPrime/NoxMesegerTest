@@ -91,3 +91,4 @@ export type GroupWebRTCSignal =
   | { type: 'group-ice-candidate'; candidate: RTCIceCandidateInit; callId: string; fromUserId: string; toUserId: string }
   | { type: 'group-join'; callId: string; userId: string }
   | { type: 'group-leave'; callId: string; userId: string }
+  | { type: 'group-media-state'; callId: string; userId: string; isMuted: boolean; isCameraOff: boolean; isScreenSharing: boolean }

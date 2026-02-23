@@ -63,39 +63,42 @@ function ParticipantTile({
       audioRef.current.srcObject = stream
     }
 
-    const videoTracks = stream.getVideoTracks()
-    const activeVideo = videoTracks.some((t) => t.enabled && t.readyState === 'live')
-    setHasVideo(activeVideo)
+    const checkVideo = () => {
+      const videoTracks = stream.getVideoTracks()
+      const activeVideo = videoTracks.some((t) => t.enabled && t.readyState === 'live')
+      setHasVideo(activeVideo)
 
-    if (activeVideo && videoRef.current) {
-      videoRef.current.srcObject = stream
-    } else if (videoRef.current) {
-      videoRef.current.srcObject = null
-    }
-
-    // Listen for track changes
-    const onTrackChange = () => {
-      const vt = stream.getVideoTracks()
-      const active = vt.some((t) => t.enabled && t.readyState === 'live')
-      setHasVideo(active)
-      if (active && videoRef.current) {
-        videoRef.current.srcObject = stream
+      if (videoRef.current) {
+        if (activeVideo) {
+          // Always re-assign srcObject to force the video element to pick up new tracks
+          videoRef.current.srcObject = stream
+        } else {
+          videoRef.current.srcObject = null
+        }
       }
     }
 
-    stream.addEventListener('addtrack', onTrackChange)
-    stream.addEventListener('removetrack', onTrackChange)
+    checkVideo()
+
+    // Listen for track changes on the stream itself
+    stream.addEventListener('addtrack', checkVideo)
+    stream.addEventListener('removetrack', checkVideo)
+
+    // Listen for track state changes on all current video tracks
+    const videoTracks = stream.getVideoTracks()
     videoTracks.forEach((t) => {
-      t.addEventListener('unmute', onTrackChange)
-      t.addEventListener('ended', onTrackChange)
+      t.addEventListener('unmute', checkVideo)
+      t.addEventListener('ended', checkVideo)
+      t.addEventListener('mute', checkVideo)
     })
 
     return () => {
-      stream.removeEventListener('addtrack', onTrackChange)
-      stream.removeEventListener('removetrack', onTrackChange)
+      stream.removeEventListener('addtrack', checkVideo)
+      stream.removeEventListener('removetrack', checkVideo)
       videoTracks.forEach((t) => {
-        t.removeEventListener('unmute', onTrackChange)
-        t.removeEventListener('ended', onTrackChange)
+        t.removeEventListener('unmute', checkVideo)
+        t.removeEventListener('ended', checkVideo)
+        t.removeEventListener('mute', checkVideo)
       })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
