@@ -158,8 +158,10 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   }, [])
 
   // Create a peer connection for a specific remote user
+  // isOfferer: true when WE will create the offer (we are the existing participant)
+  //            false when we RECEIVED an offer (we are the joiner)
   const createPeerConnectionForUser = useCallback(
-    (remoteUserId: string, callId: string) => {
+    (remoteUserId: string, callId: string, isOfferer: boolean) => {
       if (peerConnectionsRef.current.has(remoteUserId)) {
         return peerConnectionsRef.current.get(remoteUserId)!
       }
@@ -174,19 +176,25 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         })
       }
 
-      // Always create a dedicated video transceiver so we have a stable sender
-      // for replacing camera/screen tracks later
-      const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
-      videoSendersRef.current.set(remoteUserId, transceiver.sender)
+      if (isOfferer) {
+        // As the offerer, we create a dedicated video transceiver.
+        // The answerer will match it from our SDP.
+        const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+        videoSendersRef.current.set(remoteUserId, transceiver.sender)
 
-      // If we already have a video track (camera or screen), use it
-      const currentVideoTrack =
-        screenStreamRef.current?.getVideoTracks()[0] ||
-        localStreamRef.current?.getVideoTracks()[0] ||
-        null
-      if (currentVideoTrack) {
-        transceiver.sender.replaceTrack(currentVideoTrack)
+        // If we already have a video track (camera or screen), use it
+        const currentVideoTrack =
+          screenStreamRef.current?.getVideoTracks()[0] ||
+          localStreamRef.current?.getVideoTracks()[0] ||
+          null
+        if (currentVideoTrack) {
+          transceiver.sender.replaceTrack(currentVideoTrack)
+        }
       }
+      // If answerer (isOfferer=false), we do NOT add a transceiver here.
+      // After setRemoteDescription, the offer's video m-line will create a
+      // matching transceiver automatically. We grab the sender from that
+      // transceiver in the group-offer handler after setRemoteDescription.
 
       // Create ONE stable MediaStream per peer — we will add/remove tracks on it
       const remoteStream = new MediaStream()
@@ -281,7 +289,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             return updated
           })
 
-          const pc = createPeerConnectionForUser(signal.userId, callId)
+          const pc = createPeerConnectionForUser(signal.userId, callId, true)
           if (!pc) return
 
           try {
@@ -326,11 +334,33 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             videoSendersRef.current.delete(signal.fromUserId)
           }
 
-          const pc = createPeerConnectionForUser(signal.fromUserId, callId)
+          // Create as answerer (isOfferer=false) — do NOT add our own video transceiver
+          const pc = createPeerConnectionForUser(signal.fromUserId, callId, false)
           if (!pc) return
 
           try {
+            // Setting remote description will auto-create a matching video transceiver
+            // from the offerer's SDP
             await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+
+            // Now find the video transceiver that was created from the remote offer
+            // and grab its sender so we can replaceTrack on it later
+            const videoTransceiver = pc.getTransceivers().find(
+              (t) => t.receiver.track.kind === 'video'
+            )
+            if (videoTransceiver) {
+              videoSendersRef.current.set(signal.fromUserId, videoTransceiver.sender)
+
+              // If we already have a video track (camera or screen), send it
+              const currentVideoTrack =
+                screenStreamRef.current?.getVideoTracks()[0] ||
+                localStreamRef.current?.getVideoTracks()[0] ||
+                null
+              if (currentVideoTrack) {
+                await videoTransceiver.sender.replaceTrack(currentVideoTrack)
+              }
+            }
+
             await flushPendingCandidates(signal.fromUserId)
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)

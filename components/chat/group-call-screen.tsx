@@ -85,9 +85,9 @@ function ParticipantTile({
     return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
   }
 
-  // Determine if we should show video: either we detected active video tracks,
-  // or the peer reports having camera/screen share on (their track may still be arriving)
-  const peerHasMediaActive = hasVideo || (!peer.isCameraOff || peer.isScreenSharing)
+  // Show video element when we have an active video track
+  // Show avatar when there's no video
+  const showVideoElement = hasVideo
 
   return (
     <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video group/tile">
@@ -96,11 +96,11 @@ function ParticipantTile({
         ref={videoRef}
         autoPlay
         playsInline
-        className={`h-full w-full object-cover ${peerHasMediaActive && hasVideo ? '' : 'hidden'}`}
+        className={`h-full w-full object-cover ${showVideoElement ? '' : 'hidden'}`}
       />
 
       {/* Show avatar when no video */}
-      {!(peerHasMediaActive && hasVideo) && (
+      {!showVideoElement && (
         <div className="flex flex-col items-center gap-2">
           <Avatar className="h-16 w-16">
             <AvatarImage src={peer.profile?.avatar_url || undefined} />
