@@ -56,7 +56,9 @@ function ParticipantTile({
   // Attach stream and detect video
   useEffect(() => {
     const stream = peer.stream
+    console.log('[v0] ParticipantTile effect - Peer:', peer.userId, 'Stream:', !!stream, 'StreamVersion:', streamVersion)
     if (!stream) {
+      console.log('[v0] No stream for peer:', peer.userId)
       setHasVideo(false)
       if (videoRef.current) videoRef.current.srcObject = null
       if (audioRef.current) audioRef.current.srcObject = null
@@ -71,21 +73,25 @@ function ParticipantTile({
     // Check if the stream has video tracks
     const videoTracks = stream.getVideoTracks()
     const hasVideoTrack = videoTracks.length > 0
+    console.log('[v0] Peer:', peer.userId, 'VideoTracks:', videoTracks.length, 'CameraOff:', peer.isCameraOff, 'ScreenSharing:', peer.isScreenSharing, 'ReportsVideo:', peerReportsVideo)
 
     // Use peer's reported state as primary signal, track existence as secondary
     const activeVideo = hasVideoTrack && peerReportsVideo
     setHasVideo(activeVideo)
+    console.log('[v0] Peer:', peer.userId, 'ActiveVideo:', activeVideo)
 
     // Always attach stream to video element when peer reports having video
     // so the video element is ready to display frames
     if (videoRef.current) {
       if (activeVideo) {
+        console.log('[v0] Attaching video stream for peer:', peer.userId)
         videoRef.current.srcObject = stream
       } else {
+        console.log('[v0] Detaching video stream for peer:', peer.userId)
         videoRef.current.srcObject = null
       }
     }
-  }, [peer.stream, peerReportsVideo, streamVersion])
+  }, [peer.stream, peer.userId, peer.isCameraOff, peer.isScreenSharing, peerReportsVideo, streamVersion])
 
   const getInitials = (name: string | null) => {
     if (!name) return '?'

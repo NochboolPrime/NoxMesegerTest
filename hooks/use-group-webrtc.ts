@@ -187,7 +187,12 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         const screenTrack = screenStreamRef.current.getVideoTracks()[0]
         const sender = videoSendersRef.current.get(remoteUserId)
         if (sender && screenTrack) {
-          sender.replaceTrack(screenTrack)
+          console.log('[v0] Replacing video track with screen share for peer:', remoteUserId)
+          sender.replaceTrack(screenTrack).then(() => {
+            console.log('[v0] Screen share track replaced successfully for peer:', remoteUserId)
+          }).catch((err) => {
+            console.error('[v0] Failed to replace screen share track:', err)
+          })
         }
       }
 
@@ -197,24 +202,36 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
       pc.ontrack = (event) => {
         const track = event.track
+        console.log('[v0] Received track from peer:', remoteUserId, 'Kind:', track.kind, 'ID:', track.id, 'Muted:', track.muted, 'ReadyState:', track.readyState)
         const currentStream = peerStreamsRef.current.get(remoteUserId)
         if (!currentStream) return
 
         // Replace existing track of same kind
         currentStream.getTracks().forEach((t) => {
           if (t.kind === track.kind && t.id !== track.id) {
+            console.log('[v0] Removing old track:', t.kind, t.id, 'for peer:', remoteUserId)
             currentStream.removeTrack(t)
           }
         })
 
         if (!currentStream.getTrackById(track.id)) {
+          console.log('[v0] Adding new track to stream:', track.kind, track.id, 'for peer:', remoteUserId)
           currentStream.addTrack(track)
         }
 
         // When track unmutes (becomes active), notify UI
-        track.onunmute = () => notifyStreamUpdate(remoteUserId)
-        track.onended = () => notifyStreamUpdate(remoteUserId)
-        track.onmute = () => notifyStreamUpdate(remoteUserId)
+        track.onunmute = () => {
+          console.log('[v0] Track unmuted:', track.kind, 'for peer:', remoteUserId)
+          notifyStreamUpdate(remoteUserId)
+        }
+        track.onended = () => {
+          console.log('[v0] Track ended:', track.kind, 'for peer:', remoteUserId)
+          notifyStreamUpdate(remoteUserId)
+        }
+        track.onmute = () => {
+          console.log('[v0] Track muted:', track.kind, 'for peer:', remoteUserId)
+          notifyStreamUpdate(remoteUserId)
+        }
 
         notifyStreamUpdate(remoteUserId)
       }
@@ -247,15 +264,20 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
       // Handle renegotiation (fires when addTrack/removeTrack is called)
       pc.onnegotiationneeded = async () => {
-        // Only offerer initiates renegotiation to avoid glare
-        if (!isOfferer) return
-        if (makingOfferRef.current.get(remoteUserId)) return
+        // Allow both offerer and answerer to initiate renegotiation
+        // This is needed when a joiner enables camera/screen share
+        if (makingOfferRef.current.get(remoteUserId)) {
+          console.log('[v0] Already making offer to peer:', remoteUserId, ', skipping negotiation')
+          return
+        }
 
         try {
+          console.log('[v0] Negotiation needed for peer:', remoteUserId, 'isOfferer:', isOfferer)
           makingOfferRef.current.set(remoteUserId, true)
           const offer = await pc.createOffer()
           await pc.setLocalDescription(offer)
 
+          console.log('[v0] Sending offer to peer:', remoteUserId)
           sendSignal({
             type: 'group-offer',
             sdp: pc.localDescription!,
@@ -264,7 +286,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             toUserId: remoteUserId,
           })
         } catch (err) {
-          console.error('Renegotiation failed:', err)
+          console.error('[v0] Renegotiation failed:', err)
         } finally {
           makingOfferRef.current.set(remoteUserId, false)
         }
@@ -327,6 +349,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         }
 
         case 'group-offer': {
+          console.log('[v0] Received offer from peer:', signal.fromUserId)
           const profile = await loadPeerProfile(signal.fromUserId)
           setPeers((prev) => {
             const updated = new Map(prev)
@@ -347,12 +370,30 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
           if (pc) {
             // Existing connection - handle renegotiation
+            console.log('[v0] Handling renegotiation offer from peer:', signal.fromUserId)
+            
+            // Implement collision detection for perfect negotiation
+            const isOfferer = currentUserId! > signal.fromUserId // Stable ordering based on user ID
+            const makingOffer = makingOfferRef.current.get(signal.fromUserId)
+            
+            // If we're in the middle of making an offer and we're the polite peer, rollback
+            if (makingOffer && !isOfferer) {
+              console.log('[v0] Collision detected, rolling back our offer (polite peer)')
+              await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
+              makingOfferRef.current.set(signal.fromUserId, false)
+            } else if (makingOffer && isOfferer) {
+              // We're the impolite peer and making an offer, ignore their offer
+              console.log('[v0] Collision detected, ignoring their offer (impolite peer)')
+              return
+            }
+            
             try {
               await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
               await flushPendingCandidates(signal.fromUserId)
               const answer = await pc.createAnswer()
               await pc.setLocalDescription(answer)
 
+              console.log('[v0] Sending renegotiation answer to peer:', signal.fromUserId)
               sendSignal({
                 type: 'group-answer',
                 sdp: pc.localDescription!,
@@ -361,12 +402,13 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
                 toUserId: signal.fromUserId,
               })
             } catch (err) {
-              console.error('Renegotiation answer failed:', err)
+              console.error('[v0] Renegotiation answer failed:', err)
             }
             break
           }
 
           // New connection - we are the answerer (joiner)
+          console.log('[v0] Creating new peer connection for peer:', signal.fromUserId)
           pc = createPeerConnectionForUser(signal.fromUserId, callId, false)
           if (!pc) return
 
@@ -376,6 +418,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
 
+            console.log('[v0] Sending initial answer to peer:', signal.fromUserId)
             sendSignal({
               type: 'group-answer',
               sdp: pc.localDescription!,
@@ -384,7 +427,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
               toUserId: signal.fromUserId,
             })
           } catch (err) {
-            console.error('Failed to handle offer from peer:', err)
+            console.error('[v0] Failed to handle offer from peer:', err)
           }
           break
         }
@@ -434,16 +477,20 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         }
 
         case 'group-media-state': {
+          console.log('[v0] Received media state from peer:', signal.userId, 'Muted:', signal.isMuted, 'CameraOff:', signal.isCameraOff, 'ScreenSharing:', signal.isScreenSharing)
           setPeers((prev) => {
             const updated = new Map(prev)
             const existing = updated.get(signal.userId)
             if (existing) {
+              console.log('[v0] Updating peer media state for:', signal.userId)
               updated.set(signal.userId, {
                 ...existing,
                 isMuted: signal.isMuted,
                 isCameraOff: signal.isCameraOff,
                 isScreenSharing: signal.isScreenSharing,
               })
+            } else {
+              console.log('[v0] Peer not found in state, cannot update:', signal.userId)
             }
             return updated
           })
@@ -480,6 +527,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
   const broadcastMediaState = useCallback((newMuted: boolean, newCameraOff: boolean, newScreenSharing: boolean) => {
     if (!currentUserId || !groupCallIdRef.current) return
+    console.log('[v0] Broadcasting media state - Muted:', newMuted, 'CameraOff:', newCameraOff, 'ScreenSharing:', newScreenSharing)
     sendSignal({
       type: 'group-media-state',
       callId: groupCallIdRef.current,
@@ -657,27 +705,60 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   }, [broadcastMediaState])
 
   // Helper: replace video track on ALL peer connections
-  const replaceVideoTrackOnAllPeers = useCallback((track: MediaStreamTrack | null) => {
-    videoSendersRef.current.forEach((sender) => {
-      sender.replaceTrack(track).catch(() => {})
+  const replaceVideoTrackOnAllPeers = useCallback(async (track: MediaStreamTrack | null) => {
+    console.log('[v0] Replacing video track on all peers. Track:', track ? track.kind + ' - ' + track.id : 'null', 'Peer count:', videoSendersRef.current.size)
+    
+    const replacePromises: Promise<void>[] = []
+    
+    videoSendersRef.current.forEach((sender, peerId) => {
+      console.log('[v0] Replacing track for peer:', peerId)
+      const promise = sender.replaceTrack(track).then(() => {
+        console.log('[v0] Successfully replaced track for peer:', peerId)
+        
+        // Force renegotiation by setting needsRenegotiation flag
+        // This ensures the remote peer receives the new track
+        const pc = peerConnectionsRef.current.get(peerId)
+        if (pc && pc.connectionState === 'connected') {
+          console.log('[v0] Triggering renegotiation for peer:', peerId)
+          // Manually trigger negotiation by modifying the connection
+          // The onnegotiationneeded event should fire automatically, but we'll ensure it
+          setTimeout(() => {
+            if (pc.onnegotiationneeded) {
+              console.log('[v0] Manually calling onnegotiationneeded for peer:', peerId)
+              pc.onnegotiationneeded(new Event('negotiationneeded'))
+            }
+          }, 100)
+        }
+      }).catch((err) => {
+        console.error('[v0] Failed to replace track for peer:', peerId, err)
+      })
+      
+      replacePromises.push(promise)
     })
+    
+    await Promise.all(replacePromises)
+    console.log('[v0] All track replacements complete')
   }, [])
 
   // Toggle camera
   const toggleCamera = useCallback(async () => {
     if (isCameraOffRef.current) {
+      console.log('[v0] Enabling camera...')
       try {
         const videoStream = await navigator.mediaDevices.getUserMedia({
           video: { width: 640, height: 480, facingMode: 'user' },
         })
         const videoTrack = videoStream.getVideoTracks()[0]
+        console.log('[v0] Got camera track:', videoTrack.id)
 
         if (localStreamRef.current) {
           localStreamRef.current.getVideoTracks().forEach((t) => {
+            console.log('[v0] Stopping old video track:', t.id)
             t.stop()
             localStreamRef.current?.removeTrack(t)
           })
           localStreamRef.current.addTrack(videoTrack)
+          console.log('[v0] Added new camera track to local stream')
         }
 
         replaceVideoTrackOnAllPeers(videoTrack)
@@ -690,11 +771,13 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         setStreamVersion((v) => v + 1)
         broadcastMediaState(isMuted, false, isScreenSharingRef.current)
       } catch (err) {
-        console.error('Failed to enable camera:', err)
+        console.error('[v0] Failed to enable camera:', err)
       }
     } else {
+      console.log('[v0] Disabling camera...')
       if (localStreamRef.current) {
         localStreamRef.current.getVideoTracks().forEach((track) => {
+          console.log('[v0] Stopping camera track:', track.id)
           track.stop()
           localStreamRef.current?.removeTrack(track)
         })
@@ -708,30 +791,39 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       setIsCameraOff(true)
       setStreamVersion((v) => v + 1)
       broadcastMediaState(isMuted, true, isScreenSharingRef.current)
+      console.log('[v0] Camera disabled')
     }
   }, [isMuted, replaceVideoTrackOnAllPeers, broadcastMediaState])
 
   // Toggle screen share
   const toggleScreenShare = useCallback(async () => {
     if (isScreenSharingRef.current) {
+      console.log('[v0] Stopping screen share...')
       if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((t) => t.stop())
+        screenStreamRef.current.getTracks().forEach((t) => {
+          console.log('[v0] Stopping screen share track:', t.id)
+          t.stop()
+        })
         screenStreamRef.current = null
       }
 
       if (!isCameraOffRef.current) {
+        console.log('[v0] Returning to camera after screen share')
         try {
           const camStream = await navigator.mediaDevices.getUserMedia({
             video: { width: 640, height: 480, facingMode: 'user' },
           })
           const camTrack = camStream.getVideoTracks()[0]
+          console.log('[v0] Got camera track:', camTrack.id)
 
           if (localStreamRef.current) {
             localStreamRef.current.getVideoTracks().forEach((t) => {
+              console.log('[v0] Removing screen track from local stream:', t.id)
               t.stop()
               localStreamRef.current?.removeTrack(t)
             })
             localStreamRef.current.addTrack(camTrack)
+            console.log('[v0] Added camera track back to local stream')
           }
 
           replaceVideoTrackOnAllPeers(camTrack)
@@ -740,14 +832,17 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
           }
         } catch {
+          console.log('[v0] Failed to get camera, removing video')
           replaceVideoTrackOnAllPeers(null)
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = null
           }
         }
       } else {
+        console.log('[v0] Camera was off, removing video track')
         if (localStreamRef.current) {
           localStreamRef.current.getVideoTracks().forEach((t) => {
+            console.log('[v0] Removing screen track:', t.id)
             t.stop()
             localStreamRef.current?.removeTrack(t)
           })
@@ -761,7 +856,9 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       setIsScreenSharing(false)
       setStreamVersion((v) => v + 1)
       broadcastMediaState(isMuted, isCameraOffRef.current, false)
+      console.log('[v0] Screen share stopped')
     } else {
+      console.log('[v0] Starting screen share...')
       try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -769,6 +866,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         })
         screenStreamRef.current = screenStream
         const screenTrack = screenStream.getVideoTracks()[0]
+        console.log('[v0] Got screen share track:', screenTrack.id)
 
         replaceVideoTrackOnAllPeers(screenTrack)
 
@@ -777,6 +875,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         }
 
         screenTrack.onended = () => {
+          console.log('[v0] Screen share track ended by user')
           screenStreamRef.current = null
           replaceVideoTrackOnAllPeers(null)
 
@@ -792,8 +891,9 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         setIsScreenSharing(true)
         setStreamVersion((v) => v + 1)
         broadcastMediaState(isMuted, isCameraOffRef.current, true)
-      } catch {
-        // User cancelled
+        console.log('[v0] Screen share started')
+      } catch (err) {
+        console.log('[v0] Screen share cancelled or failed:', err)
       }
     }
   }, [isMuted, replaceVideoTrackOnAllPeers, broadcastMediaState])
