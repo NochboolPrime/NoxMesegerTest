@@ -13,7 +13,6 @@ import {
   MonitorOff,
   Users,
   Maximize2,
-  Minimize2,
   X,
 } from 'lucide-react'
 import type { GroupCallState, PeerInfo } from '@/hooks/use-group-webrtc'
@@ -49,7 +48,7 @@ function ParticipantTile({
   const audioRef = useRef<HTMLAudioElement>(null)
   const [hasVideo, setHasVideo] = useState(false)
 
-  // Attach stream and check for video tracks
+  // Always attach stream to both elements and check for video tracks
   useEffect(() => {
     const stream = peer.stream
     if (!stream) {
@@ -59,49 +58,26 @@ function ParticipantTile({
       return
     }
 
+    // Always attach to audio element
     if (audioRef.current) {
       audioRef.current.srcObject = stream
     }
 
-    const checkVideo = () => {
-      const videoTracks = stream.getVideoTracks()
-      const activeVideo = videoTracks.some((t) => t.enabled && t.readyState === 'live')
-      setHasVideo(activeVideo)
+    // Check if the stream has active video tracks
+    const videoTracks = stream.getVideoTracks()
+    // A track is usable if it exists and is enabled; readyState 'live' is sufficient
+    // (the track may be in 'muted' state initially but will unmute shortly)
+    const activeVideo = videoTracks.length > 0 && videoTracks.some((t) => t.enabled && t.readyState === 'live')
+    setHasVideo(activeVideo)
 
-      if (videoRef.current) {
-        if (activeVideo) {
-          // Always re-assign srcObject to force the video element to pick up new tracks
-          videoRef.current.srcObject = stream
-        } else {
-          videoRef.current.srcObject = null
-        }
+    // Always attach to video element when there are video tracks
+    if (videoRef.current) {
+      if (activeVideo) {
+        videoRef.current.srcObject = stream
+      } else {
+        videoRef.current.srcObject = null
       }
     }
-
-    checkVideo()
-
-    // Listen for track changes on the stream itself
-    stream.addEventListener('addtrack', checkVideo)
-    stream.addEventListener('removetrack', checkVideo)
-
-    // Listen for track state changes on all current video tracks
-    const videoTracks = stream.getVideoTracks()
-    videoTracks.forEach((t) => {
-      t.addEventListener('unmute', checkVideo)
-      t.addEventListener('ended', checkVideo)
-      t.addEventListener('mute', checkVideo)
-    })
-
-    return () => {
-      stream.removeEventListener('addtrack', checkVideo)
-      stream.removeEventListener('removetrack', checkVideo)
-      videoTracks.forEach((t) => {
-        t.removeEventListener('unmute', checkVideo)
-        t.removeEventListener('ended', checkVideo)
-        t.removeEventListener('mute', checkVideo)
-      })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [peer.stream, streamVersion])
 
   const getInitials = (name: string | null) => {
@@ -109,16 +85,22 @@ function ParticipantTile({
     return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
   }
 
+  // Determine if we should show video: either we detected active video tracks,
+  // or the peer reports having camera/screen share on (their track may still be arriving)
+  const peerHasMediaActive = hasVideo || (!peer.isCameraOff || peer.isScreenSharing)
+
   return (
     <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video group/tile">
-      {hasVideo ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          className="h-full w-full object-cover"
-        />
-      ) : (
+      {/* Always render the video element (hidden when no video) so srcObject is ready */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        className={`h-full w-full object-cover ${peerHasMediaActive && hasVideo ? '' : 'hidden'}`}
+      />
+
+      {/* Show avatar when no video */}
+      {!(peerHasMediaActive && hasVideo) && (
         <div className="flex flex-col items-center gap-2">
           <Avatar className="h-16 w-16">
             <AvatarImage src={peer.profile?.avatar_url || undefined} />
@@ -183,8 +165,18 @@ function FullscreenVideoOverlay({
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
-    if (videoRef.current && peer.stream) {
-      videoRef.current.srcObject = peer.stream
+    if (videoRef.current) {
+      if (peer.stream) {
+        const videoTracks = peer.stream.getVideoTracks()
+        const hasActiveVideo = videoTracks.length > 0 && videoTracks.some((t) => t.enabled && t.readyState === 'live')
+        if (hasActiveVideo) {
+          videoRef.current.srcObject = peer.stream
+        } else {
+          videoRef.current.srcObject = null
+        }
+      } else {
+        videoRef.current.srcObject = null
+      }
     }
   }, [peer.stream, streamVersion])
 

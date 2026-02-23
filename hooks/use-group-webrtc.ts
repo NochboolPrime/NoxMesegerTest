@@ -148,9 +148,9 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       const updated = new Map(prev)
       const existing = updated.get(remoteUserId)
       if (existing) {
-        // Set the same MediaStream object so the <video> element stays attached,
-        // but spread to trigger React re-render
-        updated.set(remoteUserId, { ...existing, stream })
+        // Clone the stream to get a new object identity so React detects the change
+        const cloned = new MediaStream(stream.getTracks())
+        updated.set(remoteUserId, { ...existing, stream: cloned })
       }
       return updated
     })
@@ -407,6 +407,9 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             }
             return updated
           })
+          // Bump stream version so ParticipantTile re-evaluates video tracks
+          // (replaceTrack on sender side doesn't fire ontrack on receiver)
+          setStreamVersion((v) => v + 1)
           break
         }
       }
