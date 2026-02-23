@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import {
@@ -12,6 +12,9 @@ import {
   Monitor,
   MonitorOff,
   Users,
+  Maximize2,
+  Minimize2,
+  X,
 } from 'lucide-react'
 import type { GroupCallState, PeerInfo } from '@/hooks/use-group-webrtc'
 import type { RefObject, MutableRefObject } from 'react'
@@ -24,6 +27,7 @@ interface GroupCallScreenProps {
   isScreenSharing: boolean
   peers: Map<string, PeerInfo>
   callDuration: number
+  streamVersion: number
   localStream: MutableRefObject<MediaStream | null>
   localVideoRef: RefObject<HTMLVideoElement | null>
   onToggleMute: () => void
@@ -32,30 +36,78 @@ interface GroupCallScreenProps {
   onLeaveCall: () => void
 }
 
-function ParticipantTile({ peer }: { peer: PeerInfo }) {
+function ParticipantTile({
+  peer,
+  streamVersion,
+  onExpand,
+}: {
+  peer: PeerInfo
+  streamVersion: number
+  onExpand: () => void
+}) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
+  const [hasVideo, setHasVideo] = useState(false)
 
+  // Attach stream and check for video tracks
   useEffect(() => {
-    if (peer.stream) {
-      if (videoRef.current) {
-        videoRef.current.srcObject = peer.stream
-      }
-      if (audioRef.current) {
-        audioRef.current.srcObject = peer.stream
+    const stream = peer.stream
+    if (!stream) {
+      setHasVideo(false)
+      if (videoRef.current) videoRef.current.srcObject = null
+      if (audioRef.current) audioRef.current.srcObject = null
+      return
+    }
+
+    if (audioRef.current) {
+      audioRef.current.srcObject = stream
+    }
+
+    const videoTracks = stream.getVideoTracks()
+    const activeVideo = videoTracks.some((t) => t.enabled && t.readyState === 'live')
+    setHasVideo(activeVideo)
+
+    if (activeVideo && videoRef.current) {
+      videoRef.current.srcObject = stream
+    } else if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+
+    // Listen for track changes
+    const onTrackChange = () => {
+      const vt = stream.getVideoTracks()
+      const active = vt.some((t) => t.enabled && t.readyState === 'live')
+      setHasVideo(active)
+      if (active && videoRef.current) {
+        videoRef.current.srcObject = stream
       }
     }
-  }, [peer.stream])
+
+    stream.addEventListener('addtrack', onTrackChange)
+    stream.addEventListener('removetrack', onTrackChange)
+    videoTracks.forEach((t) => {
+      t.addEventListener('unmute', onTrackChange)
+      t.addEventListener('ended', onTrackChange)
+    })
+
+    return () => {
+      stream.removeEventListener('addtrack', onTrackChange)
+      stream.removeEventListener('removetrack', onTrackChange)
+      videoTracks.forEach((t) => {
+        t.removeEventListener('unmute', onTrackChange)
+        t.removeEventListener('ended', onTrackChange)
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peer.stream, streamVersion])
 
   const getInitials = (name: string | null) => {
     if (!name) return '?'
     return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
   }
 
-  const hasVideo = peer.stream?.getVideoTracks().some((t) => t.enabled && t.readyState === 'live')
-
   return (
-    <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video">
+    <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video group/tile">
       {hasVideo ? (
         <video
           ref={videoRef}
@@ -77,8 +129,19 @@ function ParticipantTile({ peer }: { peer: PeerInfo }) {
         </div>
       )}
 
-      {/* Audio element (hidden) */}
+      {/* Hidden audio element */}
       <audio ref={audioRef} autoPlay playsInline className="hidden" />
+
+      {/* Expand button (visible on hover) */}
+      {hasVideo && (
+        <button
+          onClick={onExpand}
+          className="absolute top-2 right-2 rounded-md bg-background/60 p-1.5 backdrop-blur-sm opacity-0 group-hover/tile:opacity-100 transition-opacity hover:bg-background/80"
+          aria-label="View fullscreen"
+        >
+          <Maximize2 className="h-4 w-4 text-foreground" />
+        </button>
+      )}
 
       {/* Name overlay */}
       <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
@@ -104,6 +167,76 @@ function ParticipantTile({ peer }: { peer: PeerInfo }) {
   )
 }
 
+// Fullscreen overlay for viewing a participant's video/screen share
+function FullscreenVideoOverlay({
+  peer,
+  streamVersion,
+  onClose,
+}: {
+  peer: PeerInfo | { userId: 'self'; profile: null; stream: MediaStream | null; isMuted: boolean; isCameraOff: boolean; isScreenSharing: boolean }
+  streamVersion: number
+  onClose: () => void
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    if (videoRef.current && peer.stream) {
+      videoRef.current.srcObject = peer.stream
+    }
+  }, [peer.stream, streamVersion])
+
+  const getInitials = (name: string | null) => {
+    if (!name) return '?'
+    return name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
+  }
+
+  const displayName = peer.userId === 'self' ? 'You' : ((peer as PeerInfo).profile?.display_name || 'User')
+
+  return (
+    <div className="fixed inset-0 z-[60] flex flex-col bg-black/95">
+      {/* Close bar */}
+      <div className="flex items-center justify-between px-4 py-3">
+        <span className="text-sm text-white font-medium">{displayName}</span>
+        <Button
+          onClick={onClose}
+          variant="ghost"
+          size="icon"
+          className="h-9 w-9 text-white hover:text-white hover:bg-white/20"
+        >
+          <X className="h-5 w-5" />
+          <span className="sr-only">Close fullscreen</span>
+        </Button>
+      </div>
+
+      <div className="flex-1 flex items-center justify-center p-4">
+        {peer.stream && peer.stream.getVideoTracks().some((t) => t.enabled && t.readyState === 'live') ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted={peer.userId === 'self'}
+            className="max-h-full max-w-full rounded-xl object-contain"
+            style={{ transform: peer.userId === 'self' && !peer.isScreenSharing ? 'scaleX(-1)' : 'none' }}
+          />
+        ) : (
+          <div className="flex flex-col items-center gap-4">
+            <Avatar className="h-24 w-24">
+              {peer.userId !== 'self' && (
+                <AvatarImage src={(peer as PeerInfo).profile?.avatar_url || undefined} />
+              )}
+              <AvatarFallback className="bg-primary/20 text-primary text-3xl">
+                {getInitials(displayName)}
+              </AvatarFallback>
+            </Avatar>
+            <span className="text-lg text-white font-medium">{displayName}</span>
+            <span className="text-sm text-white/60">No video</span>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export function GroupCallScreen({
   callState,
   isMuted,
@@ -111,6 +244,7 @@ export function GroupCallScreen({
   isScreenSharing,
   peers,
   callDuration,
+  streamVersion,
   localStream,
   localVideoRef,
   onToggleMute,
@@ -118,13 +252,21 @@ export function GroupCallScreen({
   onToggleScreenShare,
   onLeaveCall,
 }: GroupCallScreenProps) {
-  // Re-attach local stream
+  const [fullscreenPeerId, setFullscreenPeerId] = useState<string | null>(null)
+
+  // Re-attach local stream whenever it changes
   useEffect(() => {
     const local = localStream.current
-    if (local && localVideoRef.current) {
-      localVideoRef.current.srcObject = local
+    if (localVideoRef.current) {
+      if (local && (!isCameraOff || isScreenSharing)) {
+        localVideoRef.current.srcObject = isScreenSharing
+          ? local // screen share is set directly on the ref's srcObject in the hook
+          : new MediaStream(local.getTracks())
+      } else {
+        localVideoRef.current.srcObject = null
+      }
     }
-  }, [callState, isCameraOff, isScreenSharing, localStream, localVideoRef])
+  }, [callState, isCameraOff, isScreenSharing, localStream, localVideoRef, streamVersion])
 
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)
@@ -133,9 +275,8 @@ export function GroupCallScreen({
   }
 
   const peerArray = Array.from(peers.values())
-  const totalParticipants = peerArray.length + 1 // +1 for self
+  const totalParticipants = peerArray.length + 1
 
-  // Determine grid layout
   const getGridClass = () => {
     if (totalParticipants <= 1) return 'grid-cols-1'
     if (totalParticipants === 2) return 'grid-cols-2'
@@ -163,8 +304,35 @@ export function GroupCallScreen({
 
   const hasLocalVideo = !isCameraOff || isScreenSharing
 
+  // Build fullscreen overlay data
+  const getFullscreenPeer = useCallback(() => {
+    if (!fullscreenPeerId) return null
+    if (fullscreenPeerId === 'self') {
+      return {
+        userId: 'self' as const,
+        profile: null,
+        stream: localStream.current,
+        isMuted,
+        isCameraOff,
+        isScreenSharing,
+      }
+    }
+    return peers.get(fullscreenPeerId) || null
+  }, [fullscreenPeerId, peers, localStream, isMuted, isCameraOff, isScreenSharing])
+
+  const fullscreenPeer = getFullscreenPeer()
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-background">
+      {/* Fullscreen overlay */}
+      {fullscreenPeer && (
+        <FullscreenVideoOverlay
+          peer={fullscreenPeer}
+          streamVersion={streamVersion}
+          onClose={() => setFullscreenPeerId(null)}
+        />
+      )}
+
       {/* Top bar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-3">
@@ -193,7 +361,7 @@ export function GroupCallScreen({
       <div className="flex-1 overflow-y-auto p-3">
         <div className={`grid ${getGridClass()} gap-3 h-full auto-rows-fr`}>
           {/* Self tile */}
-          <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video">
+          <div className="relative flex items-center justify-center rounded-xl bg-secondary overflow-hidden aspect-video group/tile">
             {hasLocalVideo ? (
               <video
                 ref={localVideoRef}
@@ -212,6 +380,17 @@ export function GroupCallScreen({
                 </Avatar>
                 <span className="text-sm text-foreground font-medium">You</span>
               </div>
+            )}
+
+            {/* Expand button for self */}
+            {hasLocalVideo && (
+              <button
+                onClick={() => setFullscreenPeerId('self')}
+                className="absolute top-2 right-2 rounded-md bg-background/60 p-1.5 backdrop-blur-sm opacity-0 group-hover/tile:opacity-100 transition-opacity hover:bg-background/80"
+                aria-label="View fullscreen"
+              >
+                <Maximize2 className="h-4 w-4 text-foreground" />
+              </button>
             )}
 
             <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
@@ -235,7 +414,12 @@ export function GroupCallScreen({
 
           {/* Remote participant tiles */}
           {peerArray.map((peer) => (
-            <ParticipantTile key={peer.userId} peer={peer} />
+            <ParticipantTile
+              key={peer.userId}
+              peer={peer}
+              streamVersion={streamVersion}
+              onExpand={() => setFullscreenPeerId(peer.userId)}
+            />
           ))}
 
           {/* Empty state when alone */}
@@ -252,7 +436,6 @@ export function GroupCallScreen({
 
       {/* Controls */}
       <div className="flex items-center justify-center gap-4 bg-card/80 p-6 backdrop-blur-sm border-t border-border">
-        {/* Mute */}
         <Button
           onClick={onToggleMute}
           variant="outline"
@@ -267,7 +450,6 @@ export function GroupCallScreen({
           <span className="sr-only">{isMuted ? 'Unmute' : 'Mute'}</span>
         </Button>
 
-        {/* Camera */}
         <Button
           onClick={onToggleCamera}
           variant="outline"
@@ -282,7 +464,6 @@ export function GroupCallScreen({
           <span className="sr-only">{isCameraOff ? 'Turn on camera' : 'Turn off camera'}</span>
         </Button>
 
-        {/* Screen share */}
         {callState === 'active' && (
           <Button
             onClick={onToggleScreenShare}
@@ -299,7 +480,6 @@ export function GroupCallScreen({
           </Button>
         )}
 
-        {/* Leave call */}
         <Button
           onClick={onLeaveCall}
           size="lg"

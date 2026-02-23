@@ -38,6 +38,8 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   const [isScreenSharing, setIsScreenSharing] = useState(false)
   const [peers, setPeers] = useState<Map<string, PeerInfo>>(new Map())
   const [callDuration, setCallDuration] = useState(0)
+  // Increment to trigger re-renders in the call screen when remote tracks change
+  const [streamVersion, setStreamVersion] = useState(0)
 
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
@@ -48,6 +50,10 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   const groupCallIdRef = useRef<string | null>(null)
   const groupCallStateRef = useRef<GroupCallState>('idle')
   const localVideoRef = useRef<HTMLVideoElement | null>(null)
+  // Track the video transceiver sender per connection so we can reliably replaceTrack
+  const videoSendersRef = useRef<Map<string, RTCRtpSender>>(new Map())
+  // Pending ICE candidates for connections not yet ready
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
 
   const supabase = createClient()
 
@@ -72,10 +78,11 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       durationIntervalRef.current = null
     }
 
-    // Close all peer connections
     peerConnectionsRef.current.forEach((pc) => pc.close())
     peerConnectionsRef.current.clear()
     peerStreamsRef.current.clear()
+    videoSendersRef.current.clear()
+    pendingCandidatesRef.current.clear()
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop())
@@ -91,6 +98,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
     setIsMuted(false)
     setIsCameraOff(true)
     setIsScreenSharing(false)
+    setStreamVersion(0)
   }, [])
 
   // Send signal via broadcast
@@ -114,6 +122,22 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
     return stream
   }, [])
 
+  // Flush any pending ICE candidates for a peer
+  const flushPendingCandidates = useCallback(async (remoteUserId: string) => {
+    const pc = peerConnectionsRef.current.get(remoteUserId)
+    const pending = pendingCandidatesRef.current.get(remoteUserId)
+    if (pc && pending && pending.length > 0 && pc.remoteDescription) {
+      for (const candidate of pending) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate))
+        } catch {
+          // ignore
+        }
+      }
+      pendingCandidatesRef.current.set(remoteUserId, [])
+    }
+  }, [])
+
   // Create a peer connection for a specific remote user
   const createPeerConnectionForUser = useCallback(
     (remoteUserId: string, callId: string) => {
@@ -124,16 +148,25 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       const pc = new RTCPeerConnection(ICE_SERVERS)
       peerConnectionsRef.current.set(remoteUserId, pc)
 
-      // Add local tracks
+      // Add local audio tracks
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
+        localStreamRef.current.getAudioTracks().forEach((track) => {
           pc.addTrack(track, localStreamRef.current!)
         })
       }
 
-      // Add a video transceiver for future camera/screen share
-      if (!localStreamRef.current?.getVideoTracks().length) {
-        pc.addTransceiver('video', { direction: 'sendrecv' })
+      // Always create a dedicated video transceiver so we have a stable sender
+      // for replacing camera/screen tracks later
+      const transceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+      videoSendersRef.current.set(remoteUserId, transceiver.sender)
+
+      // If we already have a video track (camera or screen), use it
+      const currentVideoTrack =
+        screenStreamRef.current?.getVideoTracks()[0] ||
+        localStreamRef.current?.getVideoTracks()[0] ||
+        null
+      if (currentVideoTrack) {
+        transceiver.sender.replaceTrack(currentVideoTrack)
       }
 
       // Handle remote tracks
@@ -141,27 +174,36 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       peerStreamsRef.current.set(remoteUserId, remoteStream)
 
       pc.ontrack = (event) => {
-        if (event.streams && event.streams[0]) {
-          event.streams[0].getTracks().forEach((track) => {
-            if (!remoteStream.getTrackById(track.id)) {
-              remoteStream.addTrack(track)
-            }
-          })
-        } else if (event.track) {
-          if (!remoteStream.getTrackById(event.track.id)) {
-            remoteStream.addTrack(event.track)
+        const track = event.track
+
+        // Remove any existing track of the same kind before adding new one
+        remoteStream.getTracks().forEach((t) => {
+          if (t.kind === track.kind && t.id !== track.id) {
+            remoteStream.removeTrack(t)
           }
+        })
+
+        if (!remoteStream.getTrackById(track.id)) {
+          remoteStream.addTrack(track)
         }
 
-        // Update peers state
+        // Listen for track unmute / ended to trigger re-render
+        track.onunmute = () => setStreamVersion((v) => v + 1)
+        track.onended = () => setStreamVersion((v) => v + 1)
+
+        // Force UI update
         setPeers((prev) => {
           const updated = new Map(prev)
           const existing = updated.get(remoteUserId)
           if (existing) {
-            updated.set(remoteUserId, { ...existing, stream: remoteStream })
+            // Create a new MediaStream wrapper so React sees a new reference
+            const freshStream = new MediaStream(remoteStream.getTracks())
+            peerStreamsRef.current.set(remoteUserId, freshStream)
+            updated.set(remoteUserId, { ...existing, stream: freshStream })
           }
           return updated
         })
+        setStreamVersion((v) => v + 1)
       }
 
       // ICE candidates
@@ -179,9 +221,9 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-          // Remove peer
           peerConnectionsRef.current.delete(remoteUserId)
           peerStreamsRef.current.delete(remoteUserId)
+          videoSendersRef.current.delete(remoteUserId)
           setPeers((prev) => {
             const updated = new Map(prev)
             updated.delete(remoteUserId)
@@ -203,7 +245,8 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
       // Ignore signals not meant for us
       if ('toUserId' in signal && signal.toUserId !== currentUserId) return
       // Ignore our own signals
-      if (signal.fromUserId === currentUserId) return
+      if ('fromUserId' in signal && signal.fromUserId === currentUserId) return
+      if ('userId' in signal && signal.userId === currentUserId) return
 
       const callId = signal.callId
 
@@ -229,16 +272,20 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
           const pc = createPeerConnectionForUser(signal.userId, callId)
           if (!pc) return
 
-          const offer = await pc.createOffer()
-          await pc.setLocalDescription(offer)
+          try {
+            const offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
 
-          sendSignal({
-            type: 'group-offer',
-            sdp: pc.localDescription!,
-            callId,
-            fromUserId: currentUserId,
-            toUserId: signal.userId,
-          })
+            sendSignal({
+              type: 'group-offer',
+              sdp: pc.localDescription!,
+              callId,
+              fromUserId: currentUserId,
+              toUserId: signal.userId,
+            })
+          } catch (err) {
+            console.error('Failed to create offer for peer:', err)
+          }
           break
         }
 
@@ -259,39 +306,62 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
             return updated
           })
 
+          // Close existing connection if any (renegotiation)
+          const existingPc = peerConnectionsRef.current.get(signal.fromUserId)
+          if (existingPc) {
+            existingPc.close()
+            peerConnectionsRef.current.delete(signal.fromUserId)
+            videoSendersRef.current.delete(signal.fromUserId)
+          }
+
           const pc = createPeerConnectionForUser(signal.fromUserId, callId)
           if (!pc) return
 
-          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
-          const answer = await pc.createAnswer()
-          await pc.setLocalDescription(answer)
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+            await flushPendingCandidates(signal.fromUserId)
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
 
-          sendSignal({
-            type: 'group-answer',
-            sdp: pc.localDescription!,
-            callId,
-            fromUserId: currentUserId,
-            toUserId: signal.fromUserId,
-          })
+            sendSignal({
+              type: 'group-answer',
+              sdp: pc.localDescription!,
+              callId,
+              fromUserId: currentUserId,
+              toUserId: signal.fromUserId,
+            })
+          } catch (err) {
+            console.error('Failed to handle offer from peer:', err)
+          }
           break
         }
 
         case 'group-answer': {
           const pc = peerConnectionsRef.current.get(signal.fromUserId)
           if (pc && pc.signalingState === 'have-local-offer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+              await flushPendingCandidates(signal.fromUserId)
+            } catch (err) {
+              console.error('Failed to set remote answer:', err)
+            }
           }
           break
         }
 
         case 'group-ice-candidate': {
           const pc = peerConnectionsRef.current.get(signal.fromUserId)
-          if (pc) {
+          if (pc && pc.remoteDescription) {
             try {
               await pc.addIceCandidate(new RTCIceCandidate(signal.candidate))
             } catch {
               // ICE candidate error - ignore
             }
+          } else {
+            // Buffer candidate until remote description is set
+            const pending = pendingCandidatesRef.current.get(signal.fromUserId) || []
+            pending.push(signal.candidate)
+            pendingCandidatesRef.current.set(signal.fromUserId, pending)
           }
           break
         }
@@ -301,6 +371,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
           if (pc) pc.close()
           peerConnectionsRef.current.delete(signal.userId)
           peerStreamsRef.current.delete(signal.userId)
+          videoSendersRef.current.delete(signal.userId)
           setPeers((prev) => {
             const updated = new Map(prev)
             updated.delete(signal.userId)
@@ -310,7 +381,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         }
       }
     },
-    [currentUserId, createPeerConnectionForUser, sendSignal, loadPeerProfile]
+    [currentUserId, createPeerConnectionForUser, sendSignal, loadPeerProfile, flushPendingCandidates]
   )
 
   // Subscribe to signaling channel
@@ -345,10 +416,8 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         setGroupCallType(type)
         setGroupCallState('joining')
 
-        // Get audio stream
         await getAudioStream()
 
-        // Create the group call record
         const { data: call, error } = await supabase
           .from('group_calls')
           .insert({
@@ -364,7 +433,6 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
         setGroupCallId(call.id)
 
-        // Add self as participant
         await supabase.from('group_call_participants').insert({
           call_id: call.id,
           user_id: currentUserId,
@@ -374,7 +442,6 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
         setGroupCallState('active')
 
-        // Start duration timer
         durationIntervalRef.current = setInterval(() => {
           setCallDuration((prev) => prev + 1)
         }, 1000)
@@ -404,10 +471,8 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         setGroupCallState('joining')
         setGroupCallId(call.id)
 
-        // Get audio stream
         await getAudioStream()
 
-        // Add self as participant
         await supabase.from('group_call_participants').upsert({
           call_id: call.id,
           user_id: currentUserId,
@@ -444,7 +509,6 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
         setGroupCallState('active')
 
-        // Start duration timer
         durationIntervalRef.current = setInterval(() => {
           setCallDuration((prev) => prev + 1)
         }, 1000)
@@ -468,21 +532,19 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
   const leaveGroupCall = useCallback(async () => {
     if (!currentUserId || !groupCallIdRef.current) return
 
-    // Broadcast leave signal
     sendSignal({
       type: 'group-leave',
       callId: groupCallIdRef.current,
       userId: currentUserId,
     })
 
-    // Update DB
     await supabase
       .from('group_call_participants')
       .update({ left_at: new Date().toISOString() })
       .eq('call_id', groupCallIdRef.current)
       .eq('user_id', currentUserId)
 
-    // Check if we're the last one - if so, end the call
+    // Check if we're the last one
     const { data: remaining } = await supabase
       .from('group_call_participants')
       .select('id')
@@ -512,35 +574,40 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
     }
   }, [])
 
+  // Helper: replace video track on ALL peer connections via dedicated video sender
+  const replaceVideoTrackOnAllPeers = useCallback((track: MediaStreamTrack | null) => {
+    videoSendersRef.current.forEach((sender) => {
+      sender.replaceTrack(track).catch(() => {
+        // ignore errors on closed connections
+      })
+    })
+  }, [])
+
   // Toggle camera
   const toggleCamera = useCallback(async () => {
     if (isCameraOff) {
-      // Enable camera
       try {
         const videoStream = await navigator.mediaDevices.getUserMedia({
           video: { width: 640, height: 480, facingMode: 'user' },
         })
         const videoTrack = videoStream.getVideoTracks()[0]
 
-        // Add track to local stream
+        // Store on local stream
         if (localStreamRef.current) {
+          // Remove any old video tracks
+          localStreamRef.current.getVideoTracks().forEach((t) => {
+            t.stop()
+            localStreamRef.current?.removeTrack(t)
+          })
           localStreamRef.current.addTrack(videoTrack)
         }
 
-        // Replace track on all peer connections
-        peerConnectionsRef.current.forEach((pc) => {
-          const senders = pc.getSenders()
-          const videoSender = senders.find((s) => s.track?.kind === 'video' || (!s.track && s))
-          if (videoSender) {
-            videoSender.replaceTrack(videoTrack)
-          } else {
-            pc.addTrack(videoTrack, localStreamRef.current!)
-          }
-        })
+        // Replace on all peer connections
+        replaceVideoTrackOnAllPeers(videoTrack)
 
         // Attach to local preview
         if (localVideoRef.current && localStreamRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current
+          localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
         }
 
         setIsCameraOff(false)
@@ -555,19 +622,16 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
           track.stop()
           localStreamRef.current?.removeTrack(track)
         })
+      }
 
-        // Replace with null on peer connections
-        peerConnectionsRef.current.forEach((pc) => {
-          const senders = pc.getSenders()
-          const videoSender = senders.find((s) => s.track?.kind === 'video')
-          if (videoSender) {
-            videoSender.replaceTrack(null)
-          }
-        })
+      replaceVideoTrackOnAllPeers(null)
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null
       }
       setIsCameraOff(true)
     }
-  }, [isCameraOff])
+  }, [isCameraOff, replaceVideoTrackOnAllPeers])
 
   // Toggle screen share
   const toggleScreenShare = useCallback(async () => {
@@ -580,17 +644,19 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
 
       // Replace with camera track or null
       const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null
-      peerConnectionsRef.current.forEach((pc) => {
-        const senders = pc.getSenders()
-        const videoSender = senders.find((s) => s.track?.kind === 'video')
-        if (videoSender) {
-          videoSender.replaceTrack(cameraTrack)
+      replaceVideoTrackOnAllPeers(cameraTrack)
+
+      // Update local preview
+      if (localVideoRef.current) {
+        if (cameraTrack && localStreamRef.current) {
+          localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
+        } else {
+          localVideoRef.current.srcObject = null
         }
-      })
+      }
 
       setIsScreenSharing(false)
     } else {
-      // Start screen sharing
       try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -599,28 +665,27 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         screenStreamRef.current = screenStream
         const screenTrack = screenStream.getVideoTracks()[0]
 
-        // Replace video track on all peers
-        peerConnectionsRef.current.forEach((pc) => {
-          const senders = pc.getSenders()
-          const videoSender = senders.find(
-            (s) => s.track?.kind === 'video' || (!s.track && s)
-          )
-          if (videoSender) {
-            videoSender.replaceTrack(screenTrack)
-          }
-        })
+        replaceVideoTrackOnAllPeers(screenTrack)
 
-        // Handle screen share ending
+        // Show screen share in local preview
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = screenStream
+        }
+
+        // Handle screen share ending (user clicks browser stop)
         screenTrack.onended = () => {
           screenStreamRef.current = null
           const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null
-          peerConnectionsRef.current.forEach((pc) => {
-            const senders = pc.getSenders()
-            const videoSender = senders.find((s) => s.track?.kind === 'video')
-            if (videoSender) {
-              videoSender.replaceTrack(cameraTrack)
+          replaceVideoTrackOnAllPeers(cameraTrack)
+
+          if (localVideoRef.current) {
+            if (cameraTrack && localStreamRef.current) {
+              localVideoRef.current.srcObject = new MediaStream(localStreamRef.current.getTracks())
+            } else {
+              localVideoRef.current.srcObject = null
             }
-          })
+          }
+
           setIsScreenSharing(false)
         }
 
@@ -629,7 +694,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
         // User cancelled screen share
       }
     }
-  }, [isScreenSharing])
+  }, [isScreenSharing, replaceVideoTrackOnAllPeers])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -647,6 +712,7 @@ export function useGroupWebRTC({ currentUserId, conversationId }: UseGroupWebRTC
     isScreenSharing,
     peers,
     callDuration,
+    streamVersion,
     localStream: localStreamRef,
     localVideoRef,
     startGroupCall,
